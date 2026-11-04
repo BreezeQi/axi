@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.0.15] - 2026-11-04
+
+新增输出 Schema 文档能力，供 Agent 搜索工具、定位字段，并按需查看入参、局部结构或完整输出定义。
+
+### Added
+
+- 原生 Python 工具通过 `@tool(output_schema=...)` 注册 Pydantic 2 模型类或 JSON Schema 字典，模型按 serialization 模式转换；外部 MCP 工具从清单的 `outputSchema` 或 AXI `_meta` 导入定义，统一保存为 `output_schema`。
+- 字段文档统一为“JSONPath: 类型；自身 description”，覆盖对象属性、数组模板、固定元组位置和特殊字段名，保留引用、可空与组合关系。`$` 固定指向完整正常成功业务值，CLI 外层信封不计入，业务自身层级保留；说明不推断含义、不追加祖先说明或约束文案。
+- `search(query, top_k=5, tool=None)` 的工具说明与输出字段分别建库，共用 BM25、可选 Embedding 和 RRF，以工具路优先交错去重取 K；字段按最强命中推荐工具，不累计数量加分。指定 tool 时只检索该工具的输出字段，复用现有相关性和精确名称／JSONPath 定位。
+- search、grep 返回完整命中字段文本 `matched_fields`，每个入选工具独立收集摘要。`search.maxFields` 默认8，0仅隐藏摘要；search 按相关性，grep 按数据层级稳定排序后截取，不因父节点命中自动展开后代。
+- `describe(name, fields=None, schema=False)` 默认查看业务说明和完整入参；传 JSONPath 数组时只查看输出，`["$"]` 查看根目录，具体路径查看所选位置，`[]` 返回空输出视图。所选节点固定展开一级，支持父子选择并集、显式深层路径、就近未知提示和批量逐项错误隔离。
+- describe 的 `output_fields` 为阅读用文档字符串，保留对象、数组、元组位置和 anyOf/oneOf/allOf 分支，未登记 Schema 时明确标记。MCP flat 通过 AXI 元数据导出定义，并提供 `axi_describe` 按导出工具名查看。
+- `describe(..., schema=True)`／CLI `--schema` 按需返回已登记的完整标准输出 JSON Schema，保留引用与约束；各入口共用，不执行业务工具，与非 null 的 fields 互斥。默认入参及局部查看行为不变。
+
+### Changed
+
+- 输出 Schema 仅用于搜索和查看，由注册方提供完整正常业务返回的定义，保留 constants/columns/values 等实际层级；声明定义不改变工具签名、入参校验或示例编码，不参与返回校验、转换、裁剪或自动解码。
+- search、grep 保持各入口目录边界：CLI 的 Native、daemon MCP 各最多 K 个，Native 在前拼接并保留跨来源同名结果；MCP meta 对合并目录整体取 K，Python Registry 对自身目录整体取 K。CLI Native 使用 BM25，其余目录沿用自身 Embedding 配置。
+- search、grep、describe 共用按需准备的字段文档、释义与原 Schema 连接，定义更新通过重新注册生效。数据路径最多64层，引用与组合不增加数据层级；保留递归保护，简化重复 anyOf/allOf，oneOf 保留分支与嵌套。
+
+### Fixed
+
+- MCP 调用保留工具错误优先；成功时直接返回 `structuredContent`（包括空对象），跳过无用的 `content` 展示转换，修复仅结构化结果被读成空列表、混合结果丢失业务数据的问题；无结构化结果时沿用文本解析，不增加请求或重试。
+- CLI 远程发现失败时提示原因并保留本地结果；批量 describe 逐工具请求，保留顺序与单项错误，文档生成与响应编码不阻塞请求事件循环。
+- CLI list 只获取目录摘要，MCP 导出按 server 筛选完整目录，避免传输无关输出定义；未知 server 提示基于已知目录，必要时补读远程摘要。
+
+注册和使用示例见 [README](README.md) 与[使用指南](docs/guide.md)；字段格式、检索、查看和 Schema 支持范围见[输出字段契约](docs/output-format.md)，内部职责与生命周期见[架构设计](docs/architecture.md)。自带技能同步提供按当前信息缺口选择 search、grep、describe 或直接调用的指导。
+
 ## [0.0.14] - 2026-11-04
 
 ### Fixed

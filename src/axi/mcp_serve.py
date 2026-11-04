@@ -1,7 +1,7 @@
 """将 axi 工具导出为 MCP server（stdio / streamable HTTP）。
 
 两种暴露形态（互斥）：
-- flat（平铺）：registry 中每个工具注册为独立 MCP tool，对端直接调用
+- flat（平铺）：每个业务工具直接调用；含输出 Schema 时另提供按需 describe
 - meta（元工具）：只暴露 search / grep / describe / run 四个固定工具，
   对端以渐进式披露的方式发现和调用，上下文占用恒定
 """
@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from typing import Any
 
 import mcp.types as types
@@ -21,20 +21,26 @@ from mcp.server.lowlevel import Server
 
 from axi.config import app_config
 from axi.context import set_request_env
-from axi.daemon.client import daemon_request
-from axi.daemon.protocol import LOG_PATH, DaemonRequest
+from axi.daemon.client import fetch_tool_catalog, fetch_tool_summaries
+from axi.daemon.protocol import LOG_PATH
 from axi.executor import Executor
-from axi.models import RunResult, ToolMeta
+from axi.models import (
+    DescribeOptions,
+    RunResult,
+    SearchResult,
+    ToolDescription,
+    ToolMeta,
+)
+from axi.output.registration import OUTPUT_SCHEMA_META_KEY
 from axi.registry import Registry, ToolResolveError, split_names
 
 logger = logging.getLogger(__name__)
 
 _META_INSTRUCTIONS = (
-    "axi exposes a searchable tool registry. Workflow: "
-    "1) search(query) or grep(pattern) to discover tools; "
-    "2) describe(name) to inspect the input schema; "
-    "3) run(name, params) to execute. "
-    "Results of run are wrapped as {status, data, error}."
+    "Discover capabilities with search only when needed; describe supplies inputs, selected fields or the complete output schema. "
+    "Reuse known contracts and call run directly when ready. matched_fields lists JSONPath: type; description strings. "
+    "JSONPath $ refers to the complete successful business value, excluding AXI's envelope. "
+    "Output definitions are documentation only. run returns {status, data, error}."
 )
 
 
@@ -57,11 +63,12 @@ def build_registry(
         names is None or any(n in app_config.mcp_servers for n in names)
     )
     if need_mcp:
-        resp = daemon_request(DaemonRequest(method="list_tools"))
-        if resp.status == "success":
-            metas += [ToolMeta.model_validate(t) for t in resp.data or []]
+        try:
+            remote = fetch_tool_catalog(servers=names)
+        except RuntimeError as exc:
+            logger.warning("MCP tools unavailable: %s", exc)
         else:
-            logger.warning("MCP tools unavailable: %s", resp.error)
+            metas.extend(remote)
 
     if names:
         available = sorted({m.server for m in metas if m.server})
@@ -74,6 +81,16 @@ def build_registry(
                 f"{', '.join(unavailable)}. Check daemon log: {LOG_PATH}"
             )
         if missing:
+            if need_mcp:
+                try:
+                    summary = fetch_tool_summaries()
+                except RuntimeError as exc:
+                    logger.warning("MCP tools unavailable: %s", exc)
+                else:
+                    available = sorted(
+                        set(available)
+                        | {tool.server for tool in summary if tool.server}
+                    )
             raise SystemExit(
                 f"Error: server not found: {', '.join(missing)}. "
                 f"Available: {', '.join(available)}"
@@ -81,8 +98,8 @@ def build_registry(
         metas = [m for m in metas if m.server in names]
 
     registry = Registry() if flat else Registry.from_search_config(app_config.search)
-    for m in metas:
-        registry.register(m)
+    for meta in metas:
+        registry.register(meta)
     return registry
 
 
@@ -112,6 +129,73 @@ def _result(data: Any, is_error: bool = False) -> types.CallToolResult:
         data = json.dumps(data, ensure_ascii=False, default=str)
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=data)], is_error=is_error
+    )
+
+
+def _discover(
+    search: Callable[..., list[SearchResult]],
+    query: str,
+    limit: int,
+    *,
+    tool: str | None = None,
+) -> types.CallToolResult:
+    """在同一个工作线程内检索并编码摘要，避免阻塞事件循环。"""
+    try:
+        results = (
+            search(query, limit, tool=tool)
+            if tool is not None
+            else search(query, limit)
+        )
+    except ToolResolveError as exc:
+        return _result({"error": str(exc)}, is_error=True)
+    return _result([result.model_dump(exclude_none=True) for result in results])
+
+
+class _DescribeParams(DescribeOptions):
+    """flat 与 meta 两种导出模式共用的 describe 入参。"""
+
+    name: str
+
+
+_DESCRIBE_TOOL = types.Tool(
+    name="describe",
+    description="Inspect tool documentation. Set schema=true to read the complete registered output JSON Schema without executing the tool; omit fields or use null in this mode. "
+    "Otherwise omit fields or use null for complete inputs without output docs. "
+    'Use fields=["$"] for the output root directory, specific JSONPaths for local output structure, or [] for an empty output view. '
+    "Selected output nodes expand one level; output views omit inputs. "
+    "Use search or grep to locate output fields and reuse sufficient matches directly. "
+    "Accepts comma-separated names for batch lookup. "
+    "Explicit deep paths remain visible; overlapping selections are unioned. "
+    "output_fields is a documentation string; "
+    "combinations use anyOf(...), oneOf(...) and allOf(...). "
+    "Expanded tuples retain [n] and [n:] position labels. "
+    "Read these documents and use JSONPath to access business data.",
+    input_schema=_DescribeParams.model_json_schema(),
+)
+
+
+def _describe(
+    registry: Registry,
+    names: list[str],
+    arguments: Mapping[str, Any],
+    *,
+    exported_names: Mapping[str, str] | None = None,
+) -> types.CallToolResult:
+    """两种导出模式共用 Registry 查看流程，flat 结果改用实际导出名。"""
+    items = registry.describe_many(
+        names,
+        fields=arguments.get("fields"),
+        schema=arguments.get("schema", False),
+    )
+    descriptions = []
+    for item in items:
+        description = item.model_dump(exclude_unset=True)
+        if exported_names is not None and isinstance(item, ToolDescription):
+            description["name"] = exported_names.get(item.full_name, item.name)
+            description.pop("server", None)
+        descriptions.append(description)
+    return _result(
+        descriptions[0] if len(descriptions) == 1 else descriptions,
     )
 
 
@@ -159,6 +243,14 @@ def _sanitize(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
+def _unique_name(base: str, used: Collection[str]) -> str:
+    """重名时为新工具追加数字后缀，保留已有导出名。"""
+    name, index = base, 2
+    while name in used:
+        name, index = f"{base}_{index}", index + 1
+    return name
+
+
 def flat_name_map(metas: list[ToolMeta]) -> dict[str, str]:
     """MCP 工具名 → full_name。单 server 用裸名，多 server 加 ``server__`` 前缀。
 
@@ -168,10 +260,7 @@ def flat_name_map(metas: list[ToolMeta]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for m in metas:
         base = _sanitize(m.name if single else f"{m.server}__{m.name}")
-        name, i = base, 2
-        while name in mapping:
-            name, i = f"{base}_{i}", i + 1
-        mapping[name] = m.full_name
+        mapping[_unique_name(base, mapping)] = m.full_name
     return mapping
 
 
@@ -182,23 +271,54 @@ def _tool_description(meta: ToolMeta) -> str:
     return f"{meta.description}\n\nOutput example: {example}"
 
 
+def _export_tool(name: str, meta: ToolMeta) -> types.Tool:
+    """通过 AXI 元数据导出字段文档，不为业务工具新增 MCP 输出契约。"""
+    return types.Tool(
+        name=name,
+        description=_tool_description(meta),
+        input_schema=meta.input_schema or {"type": "object"},
+        meta={OUTPUT_SCHEMA_META_KEY: meta.output_schema}
+        if meta.output_schema is not None
+        else None,
+    )
+
+
 def _build_flat_server(registry: Registry, executor: Executor) -> Server:
-    name_map = flat_name_map(registry.list_all())
+    metas = registry.list_all()
+    name_map = flat_name_map(metas)
+    exported_names = {full_name: name for name, full_name in name_map.items()}
     # registry 在 serve 期间不可变，工具列表一次性预构建
-    tools = []
-    for mcp_name, full_name in name_map.items():
-        meta = registry.get(full_name)
+    tools = [_export_tool(exported_names[meta.full_name], meta) for meta in metas]
+    describe_name = (
+        _unique_name("axi_describe", name_map)
+        if any(meta.output_schema is not None for meta in metas)
+        else None
+    )
+    if describe_name is not None:
         tools.append(
-            types.Tool(
-                name=mcp_name,
-                description=_tool_description(meta),
-                input_schema=meta.input_schema or {"type": "object"},
+            _DESCRIBE_TOOL.model_copy(
+                update={
+                    "name": describe_name,
+                    "description": "Inspect exported tools by their names from tools/list. "
+                    + _DESCRIBE_TOOL.description,
+                }
             )
         )
 
     async def dispatch(
         ctx: ServerRequestContext, name: str, arguments: dict[str, Any]
     ) -> types.CallToolResult:
+        if describe_name is not None and name == describe_name:
+            names = [
+                name_map.get(item, item) for item in split_names(arguments["name"])
+            ]
+            return await asyncio.to_thread(
+                _describe,
+                registry,
+                names,
+                arguments,
+                exported_names=exported_names,
+            )
         full_name = name_map.get(name)
         if full_name is None:
             return _result(
@@ -218,40 +338,48 @@ def _build_flat_server(registry: Registry, executor: Executor) -> Server:
 _META_TOOLS = [
     types.Tool(
         name="search",
-        description="Hybrid search (BM25 + embedding) over available tools. "
-        "Use natural language describing the capability you need.",
+        description="Search tool names, descriptions and output field documentation. "
+        "Search the combined native and MCP catalog and return up to top_k tools in total. "
+        "matched_fields lists matching JSONPath: type; own description strings. "
+        "JSONPath $ refers to the complete successful business value, excluding AXI's envelope. "
+        "Use the paths to plan data access or pass them as a JSONPath array to describe.fields.",
         input_schema={
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "top_k": {"type": "integer", "default": 5},
+                "tool": {
+                    "type": "string",
+                    "description": "Optional tool name; search only its output field documentation using the catalog's existing field ranking.",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum tools from the combined catalog.",
+                },
             },
             "required": ["query"],
         },
     ),
     types.Tool(
         name="grep",
-        description="Regex search over tool names and descriptions. "
-        "Use when you know a fragment of the tool or server name.",
+        description="Case-insensitive full-text regex search over tool names, descriptions and output fields. "
+        "Search the combined native and MCP catalog and return up to limit tools in registration order. "
+        "Fields share search text: JSONPath: type; own description. Matching fields are stably ordered by data depth before maxFields truncation. "
+        "Tool names and descriptions match independently; ^/$ anchor each complete text.",
         input_schema={
             "type": "object",
             "properties": {
                 "pattern": {"type": "string"},
-                "limit": {"type": "integer", "default": 10},
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Maximum tools from the combined catalog.",
+                },
             },
             "required": ["pattern"],
         },
     ),
-    types.Tool(
-        name="describe",
-        description="Show a tool's full metadata including input schema. "
-        "Accepts comma-separated names for batch lookup.",
-        input_schema={
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-        },
-    ),
+    _DESCRIBE_TOOL,
     types.Tool(
         name="run",
         description="Execute a tool by name with a params object. "
@@ -268,31 +396,32 @@ _META_TOOLS = [
 ]
 
 
-def _describe_one(registry: Registry, name: str) -> dict[str, Any]:
-    try:
-        return registry.resolve(name).model_dump(exclude_none=True)
-    except ToolResolveError as e:
-        return {"error": str(e)}
-
-
 def _build_meta_server(registry: Registry, executor: Executor) -> Server:
     async def dispatch(
         ctx: ServerRequestContext, name: str, arguments: dict[str, Any]
     ) -> types.CallToolResult:
         if name == "search":
-            results = await asyncio.to_thread(
-                registry.search, arguments["query"], arguments.get("top_k", 5)
+            return await asyncio.to_thread(
+                _discover,
+                registry.search,
+                arguments["query"],
+                arguments.get("top_k", 5),
+                tool=arguments.get("tool"),
             )
-            return _result([r.model_dump(exclude_none=True) for r in results])
         if name == "grep":
-            results = await asyncio.to_thread(
-                registry.grep, arguments["pattern"], arguments.get("limit", 10)
+            return await asyncio.to_thread(
+                _discover,
+                registry.grep,
+                arguments["pattern"],
+                arguments.get("limit", 10),
             )
-            return _result([r.model_dump(exclude_none=True) for r in results])
         if name == "describe":
-            names = split_names(arguments["name"])
-            out = [_describe_one(registry, n) for n in names]
-            return _result(out[0] if len(out) == 1 else out)
+            return await asyncio.to_thread(
+                _describe,
+                registry,
+                split_names(arguments["name"]),
+                arguments,
+            )
         if name == "run":
             result = await _execute(
                 ctx,

@@ -24,7 +24,7 @@
 
 `mcpServers` 的 key 是工具组名，例如 `local/echo`，不取决于包名。MCP 工具经 daemon 执行，PTC 可直接用 `tool("local/echo")` 获取句柄；无需再为已有 MCP 工具写一个 Python 包装层。
 
-MCP 配置在 daemon 启动时加载。已有 daemon 运行时，保存配置不会立即更新连接或工具集；需要停止旧 daemon，让下一次请求重新启动。若用户正在使用有状态 MCP 会话，考虑重启会中断该会话。已运行的导出进程也需要重新启动才能刷新注册表。
+MCP 连接和搜索配置在 daemon 启动时加载。已有 daemon 运行时，保存配置不会立即更新连接、工具集或搜索配置；需要停止旧 daemon，让下一次请求重新启动。若用户正在使用有状态 MCP 会话，考虑重启会中断该会话。已运行的导出进程也需要重新启动才能刷新注册表。
 
 ```bash
 axi daemon stop
@@ -33,6 +33,10 @@ axi grep '^local/'
 ```
 
 首次连接自动启动 daemon，`status: starting` 表示连接中，`status: running` 表示 socket 已就绪。`axi doctor` 可核对实际配置、连接和工具来源，不会执行每个业务工具。不要将 server 连接故障直接判断成工具不存在。
+
+工具清单的 `outputSchema` 自动作为输出字段文档导入；未提供时读取 `_meta["axi/output_schema"]`。定义描述完整正常成功业务值，JSONPath 的 `$` 指向该值。输出定义仅用于搜索和查看，不影响实际 MCP 返回处理。分页工具清单会全部读取。
+
+工具调用先处理 `isError`；成功且提供 `structuredContent` 时直接采用该业务值，包括空对象 `{}`，否则按 `content` 解析。两者不合并，读取优先级与是否登记输出 Schema 无关。
 
 ## 导出：按工具规模选择模式
 
@@ -53,9 +57,10 @@ axi mcp --flat
 axi mcp --transport http --port 8321
 ```
 
-- 元工具模式固定注册四个入口，按需返回摘要、schema 和结果，减少预加载工具定义的上下文成本；后续发现与执行内容仍占用上下文。
-- 平铺模式直接暴露每个工具的 schema；单组使用裸工具名，多组加 `server__` 前缀，清洗后的冲突名追加数字后缀。
-- `--server a,b` 限定导出范围，native 和已导入的 MCP 工具都可选择；`--meta / --flat` 覆盖默认模式。
+- 元工具模式固定注册四个入口，按需返回摘要、schema 和结果，减少预加载工具定义的上下文成本；后续发现与执行内容仍占用上下文。search 对所导出的 Native、MCP 合并目录整体取 top_k，配置的 Embedding 覆盖该目录的工具路与字段路；CLI search 则分别查询本地、daemon 目录，各取 K 后拼接。grep 对同一合并目录按登记顺序匹配，整体最多 limit 个。
+- 平铺模式直接暴露每个工具的输入 schema；有输出定义时通过 AXI `_meta` 保留文档，并额外提供 `axi_describe`（重名时加后缀），按实际导出名查看入参，传 fields 数组时只查看所选输出节点的直接子字段。单组使用裸工具名，多组加 `server__` 前缀，清洗后的冲突名追加数字后缀。
+- meta describe 与 flat axi_describe 均可传 `schema=true` 读取完整登记的输出 JSON Schema；fields 须省略或为 null，不执行业务工具。
+- `--server a,b` 限定导出范围，native 和已导入的 MCP 工具都可选择；`--meta / --flat` 覆盖默认模式。名称未知时按可用目录提示修正，已配置但未连接的 MCP server 会单独报错。
 - 元工具 `run(name, params)` 返回 axi 的 `status/data/error` 信封；平铺调用成功直接返回工具数据，失败设置 MCP 的工具错误标志。客户端读取的是 MCP content 中的结果，不要将两种模式当成相同的信封。
 
 ## 客户端配置

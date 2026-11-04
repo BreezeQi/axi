@@ -1,159 +1,57 @@
-# axi 设计文档
+# axi 设计取舍
 
-## 定位
+axi 是 Agent 与外部系统之间的统一工具层。本文记录定位和取舍；命令操作见[使用指南](guide.md)，配置见[配置参考](configuration.md)，模块职责见[架构](architecture.md)。
 
-axi（Agent eXecution Interface）是 AI Agent 与外部系统之间的统一工具层。
+## CLI、Python 与 MCP 共用能力
 
-核心洞察：几乎所有主流 Agent 框架（Claude Code、Cursor、Devin、OpenHands 等）都把 bash/shell 作为基础能力。CLI 本质上是一个通用的、无需额外适配的 Agent-to-System 协议层——不需要写 MCP server，不需要 API wrapper，装个命令行工具就能用。
+CLI 利用 Agent 已有的 shell 执行环境提供结构化接口，避免接入每项业务都要求额外的客户端适配。
+已有 MCP server 可以直接接入；HTTP API、SDK 或内部逻辑可包装为原生 Python 函数，无需先实现 MCP server。
+业务鉴权与执行权限仍由接入系统和运行环境管理。
 
-axi 在 bash 这个"万能通道"之上，建一层 Agent-native 的协议和工具层，让 Agent 调用外部系统时，不再是"盲猜命令 → 解析人类可读输出 → 祈祷没出错"，而是有一套结构化的、可发现的、权限可控的交互方式。
+三种入口共享工具定义和执行入口，各自处理参数、传输和结果包装。CLI 查询本地与 daemon 两份目录，
+MCP meta 查询合并目录；这种边界来自入口职责，不由公共 Registry 按来源重新拆分。
+工具通常以 `server/tool_name` 命名；直接在 Python 中注册的原生工具可以没有 server 前缀。
+数量、排序及名称冲突的外部约定见[目录边界](output-format.md#目录边界)。
 
-### 与 MCP 的关系
+## 按需披露定义
 
-MCP 解决的是"Agent 怎么调用工具"的协议问题，但它需要每个系统都写一个 MCP server。axi 走的是另一条路——CLI 作为万能适配层，不需要目标系统做任何改造，同时能直接消费 MCP 生态中已有的工具定义。
+工具较多时，预先提供全部定义会持续占用上下文。search、grep 先提供相关工具和字段摘要，
+describe 再补充所需参数或输出结构；契约已明确时直接调用，不要求每次重复搜索和查看。
 
-## 设计原则
+工具说明与字段文档分别建立语料，复用相同的文本检索能力。分开索引避免新增字段改变工具路的
+BM25 语料统计；工具归属只用于整理推荐与摘要，不累计字段数量加分。
+评分、候选和交错规则统一维护在[检索契约](output-format.md#search-检索)。
 
-### 渐进式披露（Progressive Disclosure）
+## 文档与业务结果分开
 
-Agent 不需要一次性知道所有工具。当工具数量庞大时，把所有 tool definition 塞进 system prompt 会吃掉大量 context window。axi 提供按需逐层获取的机制：
+output schema 帮助 Agent 知道数据的位置、类型和含义，由注册方保证与正常业务结果一致。
+AXI 不据此校验、裁剪、修正或转换实际返回，不根据字段名推断含义，也不生成约束说明。
 
-```
-axi search "数据库"          → 工具名 + 一句话描述（最轻量）
-axi describe query_orders    → 完整 input_schema + 用法（按需展开）
-axi run query_orders ...     → 执行
-```
+内部共享节点释义和原 Schema 连接，搜索使用字段文本，查看按需选择结构；无需为不同入口、
+depth 或查询重新维护整份定义。对象、数组、元组和组合分支保留原有位置关系，避免模型据错误层级取值。
+对外 output_fields 是阅读用文档字符串，Agent 写脚本处理真实业务结果，不需要解析这段说明。
+完整支持范围见[输出字段契约](output-format.md)。
 
-### Agent-first 输出
+## 用 Python 组合调用
 
-传统 CLI 的输出是为人类设计的（表格、颜色、进度条），Agent 解析起来很脆弱。axi 的所有输出统一为紧凑 JSON，无需额外 flag。
+批量请求、工具间传参、过滤和聚合可在 Python 中完成，减少每一步都经过模型往返。
+PTC 使用同步调用句柄；并发由调用方按上游限制安排，已有 async 程序通过线程调用同步句柄。
+AXI 不额外管理分析脚本、自动保存业务结果或增加业务重试。
+用法与调用边界见[使用指南](guide.md#python-ptc)。
 
-`axi run` 的统一输出信封：
+## 连接与定义的生命周期
 
-```json
-{"status": "success", "data": {...}}
-{"status": "error", "error": "错误信息"}
-```
+原生函数在当前进程执行；MCP 连接由 daemon 长期持有，使多个 CLI 或 PTC 调用可以复用有状态会话。
+Unix socket 避免再维护一套本机网络服务；当前运行环境因此以 macOS / Linux 为主。
+工具元数据不单独持久化：MCP 定义在连接时发现，原生定义在代码加载时注册。
+daemon 空闲时自动退出，下次需要时再启动，见[空闲退出流程](architecture.md#idle-watchdog)。
 
-## 核心功能
+定义更新通过重新注册生效，索引按目录版本重建；不追踪 Schema 字典原地修改，
+也不承诺查询期间并发替换定义时的新旧版本隔离。简单构建锁避免首次并发查询重复准备索引。
+配置按进程加载，修改后重启对应服务，不额外维护热更新或兼容模式。
+每个配置文件路径对应独立 daemon，运行文件及缓存按配置路径隔离，配置入口见[配置参考](configuration.md)。
+生命周期实现见[架构](architecture.md)。
 
-### 功能一：MCP → axi 直接转换
+## 待决事项
 
-MCP server 里的 tools 自动变成 axi 可管理的工具。通过 `axi.json` 配置文件管理：
-
-```json
-// axi.json
-{
-    "mcpServers": {
-        "jina-mcp-tools": {
-            "command": "npx",
-            "args": ["jina-mcp-tools"],
-            "env": {
-                "JINA_API_KEY": "xxx"
-            }
-        },
-        "github": {
-            "command": "npx",
-            "args": ["@modelcontextprotocol/server-github"],
-            "env": {
-                "GITHUB_TOKEN": "xxx"
-            }
-        }
-    },
-    "nativeTools": [
-        {"module": "my_project.tools"},
-        {"module": "./scripts/tools.py", "name": "scripts"}
-    ]
-}
-```
-
-MCP server 的 key 名天然作为命名空间，自动隔离不同来源的工具：
-
-```bash
-axi run jina-mcp-tools/read_url --url "https://example.com"
-axi run github/list_repos --owner "anthropics"
-```
-
-### 功能二：原生 Python 注册（跳过 MCP）
-
-不是所有东西都要先包成 MCP server 再转。如果已经有一个 Python 函数、一个 REST API、一段数据库查询逻辑，应该能直接注册为 axi 工具：
-
-```python
-from axi import tool
-
-@tool(name="query_orders", description="按区域查询订单")
-def query_orders(region: str, limit: int = 10) -> dict:
-    return db.execute("SELECT * FROM orders WHERE region=%s LIMIT %s", [region, limit])
-```
-
-装饰器从函数签名 + type hints 自动提取 input_schema。注册后同时获得 CLI 调用和 PTC 调用的能力。
-
-#### nativeTools 配置格式
-
-`nativeTools` 只支持对象格式，每个条目包含 `module`（必填）和 `name`（可选）：
-
-```json
-"nativeTools": [
-    {"module": "my_project.tools"},
-    {"module": "./scripts/tools.py", "name": "scripts"}
-]
-```
-
-- **module**：支持两种形式
-  - Python 模块路径：如 `"my_project.tools"`
-  - 文件路径：如 `"./scripts/tools.py"`
-- **name**（可选）：作为 server 名，用于工具调用时的命名空间前缀。省略时自动推导：
-  - 文件路径：取 stem（如 `./scripts/tools.py` → `tools`）
-  - 模块路径：取最后一段（如 `my_project.tools` → `tools`）
-
-原生工具的调用格式与 MCP 工具一致，都是 `server/tool_name`：
-
-```bash
-axi run tools/query_orders --region cn
-```
-
-### 两条路径统一出口
-
-不管工具来源是什么，进入 axi 之后对 Agent 来说都是统一的——同一套 search、同一套 run、同一套 PTC 函数接口。
-
-## 执行模式
-
-### CLI 直接调用
-
-最基础的形态，人或 Agent 在终端里直接调用：
-
-```bash
-axi run <tool_name> --param1 value1 --param2 value2
-```
-
-### PTC 批量编程（Programmatic Tool Calling）
-
-与其让 Agent 每次调用一个工具都走一次完整的 LLM round-trip（发 JSON → 等响应 → 再发 JSON），不如让 Agent 写一段代码，在代码里直接调用多个工具、做数据过滤和聚合，最终只把精简的结果返回给 LLM。
-
-```python
-from axi import tool
-
-db = tool("query_database")
-result = await db(sql="SELECT * FROM orders")
-# 在代码里直接过滤、聚合，不回传 LLM
-```
-
-底层执行方式不是重点，直接用 Python 包装执行终端命令即可。
-
-### 工具搜索
-
-```bash
-axi search "数据库查询"       # BM25 关键词搜索（默认）
-axi grep "query_.*"            # 正则精确匹配
-```
-
-搜索策略：
-- **BM25**（默认）：基于 bm25s + jieba 分词的关键词相关性排序，支持中英文，适合自然语言查询
-- **Embedding**（可选）：通过 Jina/OpenAI 等 provider 进行语义搜索（LangChain 接入），在 `axi.json` 中配置 `search.embedding` 启用。启用后与 BM25 通过 RRF（Reciprocal Rank Fusion）混合排序，只输出相关性排序后的工具摘要
-- **正则**：精确匹配，适合 Agent 知道部分名称的场景
-
-### 工具描述
-
-```bash
-axi describe <tool_name>  # 返回 name / description / input_schema
-```
+权限模型尚未决策：继续由业务系统和运行环境管理，或提供工具／参数粒度授权，依据实际接入需求评估。

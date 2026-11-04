@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from axi.config import SearchConfig
-from axi.models import SearchResult, ToolMeta
+from axi.models import (
+    DEFAULT_MAX_FIELDS,
+    SearchResult,
+    FieldPaths,
+    ToolDescription,
+    ToolDescriptionError,
+    ToolMeta,
+)
 from axi.search.cache import EmbeddingCache, content_hash
 from axi.search.embedding import EmbeddingProvider, create_embedding_provider
 
 if TYPE_CHECKING:
+    from axi.output.describe import ToolDescriber
+    from axi.output.documents import FieldDocuments, SchemaDocument
+    from axi.output.selection import DescribeSelection
     from axi.search.hybrid import HybridSearch
     from axi.search.regex import RegexSearch
 
@@ -42,27 +53,31 @@ class Registry:
         embedding_cache: EmbeddingCache | None = None,
         weight_bm25: float = 0.3,
         weight_embedding: float = 0.7,
+        max_fields: int = DEFAULT_MAX_FIELDS,
     ) -> None:
         self._tools: dict[str, ToolMeta] = {}
+        self._version = 0
+        # 首次准备使用简单锁；search 与 grep 各自建库，互不触发对方重建。
+        self._documents_lock = Lock()
+        self._hybrid_lock = Lock()
+        self._regex_lock = Lock()
         # 搜索引擎按需构建：bm25s/jieba/numpy 是重 import，describe/run/list
         # 完全用不到，延迟到 search()/grep() 首次调用时才付这笔冷启动成本。
         self._embedding_provider = embedding_provider
         self._embedding_cache = embedding_cache
         self._weight_bm25 = weight_bm25
         self._weight_embedding = weight_embedding
+        self._max_fields = max_fields
         self._regex: RegexSearch | None = None
         self._hybrid: HybridSearch | None = None
-        # 工具集每变一次 _version +1；各引擎记住自己上次 build 的 version，
-        # 只在落后时重建——晚建的引擎不再拖着已是最新的另一引擎陪跑一次。
-        self._version = 0
+        self._documents: dict[str, SchemaDocument] = {}
         self._regex_version = -1
         self._hybrid_version = -1
 
     @classmethod
     def from_search_config(cls, cfg: SearchConfig) -> Registry:
-        """按 axi.json 的 search 配置构建带混合搜索的 Registry。"""
+        """按搜索配置创建当前目录的检索能力，沿用向量缓存标识。"""
         provider = create_embedding_provider(cfg.embedding)
-        # 模型和端点决定向量空间；API key 不参与缓存标识，也不落盘。
         namespace = content_hash(
             json.dumps(cfg.embedding.model_dump(exclude={"api_key"}), sort_keys=True)
         )
@@ -71,11 +86,13 @@ class Registry:
             embedding_cache=EmbeddingCache(namespace=namespace) if provider else None,
             weight_bm25=cfg.weights.bm25,
             weight_embedding=cfg.weights.embedding,
+            max_fields=cfg.max_fields,
         )
 
     def register(self, meta: ToolMeta) -> None:
-        """注册一个工具。"""
+        """注册或替换工具定义；更新定义后须重新注册以刷新检索索引。"""
         self._tools[meta.full_name] = meta
+        self._documents.pop(meta.full_name, None)
         self._version += 1
 
     def get(self, full_name: str) -> ToolMeta | None:
@@ -92,7 +109,8 @@ class Registry:
           - 无匹配 → 抛 ToolResolveError
         """
         if "/" in name:
-            matches = [self._tools[name]] if name in self._tools else []
+            meta = self.get(name)
+            matches = [meta] if meta is not None else []
         else:
             matches = [t for t in self._tools.values() if t.name == name]
         if len(matches) == 1:
@@ -110,9 +128,61 @@ class Registry:
         """列出所有工具。"""
         return list(self._tools.values())
 
+    def prepare_describe(self, selection: DescribeSelection) -> ToolDescriber:
+        """创建本次查看的详情组装器，底层文档由 Registry 共享。"""
+        from axi.output.describe import ToolDescriber
+
+        return ToolDescriber(selection, self._documentation)
+
+    def describe(
+        self,
+        name: str,
+        fields: FieldPaths = None,
+        *,
+        schema: bool = False,
+    ) -> ToolDescription:
+        """解析名称并查看单个工具，查找错误由调用方处理。"""
+        from axi.output.selection import DescribeSelection
+
+        meta = self.resolve(name)
+        selection = DescribeSelection.prepare(fields, schema=schema)
+        return self.prepare_describe(selection).describe(meta)
+
+    def describe_many(
+        self,
+        names: list[str],
+        fields: FieldPaths = None,
+        *,
+        schema: bool = False,
+    ) -> list[ToolDescription | ToolDescriptionError]:
+        """按名称顺序批量查看，保留重复项，单个工具失败不影响其余结果。"""
+        if not names:
+            return []
+        from axi.output.selection import DescribeSelection
+
+        describer: ToolDescriber | str
+        try:
+            describer = self.prepare_describe(
+                DescribeSelection.prepare(fields, schema=schema)
+            )
+        except ValueError as exc:
+            describer = str(exc)
+        results: list[ToolDescription | ToolDescriptionError] = []
+        for name in names:
+            try:
+                meta = self.resolve(name)
+                if isinstance(describer, str):
+                    result = ToolDescriptionError(error=describer)
+                else:
+                    result = describer.describe(meta)
+            except (ToolResolveError, ValueError) as exc:
+                result = ToolDescriptionError(error=str(exc))
+            results.append(result)
+        return results
+
     def list_names(self) -> list[str]:
         """列出所有工具的 full_name。"""
-        return list(self._tools.keys())
+        return list(self._tools)
 
     def server_tool_counts(self) -> dict[str, int]:
         """按 server 统计工具数量（无 server 归入 "unknown"）。"""
@@ -121,33 +191,82 @@ class Registry:
     def set_server(self, full_name: str, server: str) -> None:
         """更新工具的 server 名，同时更新注册 key。"""
         meta = self._tools.pop(full_name)
+        self._documents.pop(full_name, None)
         updated = meta.model_copy(update={"server": server})
-        self._tools[updated.full_name] = updated
-        self._version += 1
+        self.register(updated)
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        """混合搜索工具（BM25 + Embedding）。"""
-        if self._hybrid is None:
-            from axi.search.hybrid import HybridSearch
+    def _documentation(self, meta: ToolMeta) -> SchemaDocument:
+        """按工具共享按需准备的文档，重新注册时清除该工具的缓存。"""
+        from axi.output.documents import SchemaDocument
 
-            self._hybrid = HybridSearch(
-                embedding_provider=self._embedding_provider,
-                embedding_cache=self._embedding_cache,
-                weight_bm25=self._weight_bm25,
-                weight_embedding=self._weight_embedding,
-            )
-        if self._hybrid_version != self._version:
-            self._hybrid.build(list(self._tools.values()))
-            self._hybrid_version = self._version
-        return self._hybrid.search(query, top_k=top_k)
+        with self._documents_lock:
+            if meta.full_name not in self._documents:
+                self._documents[meta.full_name] = SchemaDocument(meta.output_schema)
+            return self._documents[meta.full_name]
 
-    def grep(self, pattern: str, top_k: int = 10) -> list[SearchResult]:
-        """正则表达式搜索工具。"""
-        if self._regex is None:
-            from axi.search.regex import RegexSearch
+    def _search_catalog(self) -> tuple[list[ToolMeta], list[FieldDocuments]]:
+        """为需要重建的索引取得工具目录及共享字段条目。"""
+        from axi.output.documents import FieldDocuments
 
-            self._regex = RegexSearch()
-        if self._regex_version != self._version:
-            self._regex.build(list(self._tools.values()))
-            self._regex_version = self._version
-        return self._regex.search(pattern, top_k=top_k)
+        tools = self.list_all()
+        empty = FieldDocuments()
+        return (
+            tools,
+            [
+                self._documentation(tool).fields
+                if tool.output_schema is not None
+                else empty
+                for tool in tools
+            ],
+        )
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        tool: str | None = None,
+    ) -> list[SearchResult]:
+        """双路检索当前目录；指定工具时只检索它的字段文档。"""
+        if top_k <= 0 or not query.strip():
+            return []
+        if tool is not None:
+            tool = self.resolve(tool).full_name
+        if not self._tools:
+            return []
+        with self._hybrid_lock:
+            if self._hybrid is None:
+                from axi.search.hybrid import HybridSearch
+
+                self._hybrid = HybridSearch(
+                    embedding_provider=self._embedding_provider,
+                    embedding_cache=self._embedding_cache,
+                    weight_bm25=self._weight_bm25,
+                    weight_embedding=self._weight_embedding,
+                    max_fields=self._max_fields,
+                )
+            if self._hybrid_version != self._version:
+                tools, field_documents = self._search_catalog()
+                self._hybrid.build(tools, field_documents=field_documents)
+                self._hybrid_version = self._version
+        return self._hybrid.search(query, top_k=top_k, tool=tool)
+
+    def grep(
+        self,
+        pattern: str,
+        top_k: int = 10,
+    ) -> list[SearchResult]:
+        """对当前目录执行全文正则，按登记顺序最多返回 K 个工具。"""
+        from axi.search.regex import RegexSearch, compile_pattern
+
+        compiled = compile_pattern(pattern)
+        if top_k <= 0:
+            return []
+        with self._regex_lock:
+            if self._regex is None:
+                self._regex = RegexSearch(max_fields=self._max_fields)
+            if self._regex_version != self._version:
+                tools, field_documents = self._search_catalog()
+                self._regex.build(tools, field_documents=field_documents)
+                self._regex_version = self._version
+        return self._regex.search(compiled, top_k=top_k)

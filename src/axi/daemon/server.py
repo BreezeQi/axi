@@ -19,13 +19,18 @@ from axi.daemon.protocol import (
     DaemonResponse,
     DaemonStatus,
 )
-from axi.models import ToolSource, allowed_types
+from axi.models import ToolDescriptionError, ToolInfo, ToolSource, allowed_types
 from axi.providers.mcp import MCPProvider
-from axi.registry import Registry, ToolResolveError
+from axi.registry import Registry, ToolResolveError, split_names
 
 logger = logging.getLogger(__name__)
 
 _IDLE_EXEMPT_METHODS = frozenset({"status", "shutdown"})
+
+
+def _encode_response(response: DaemonResponse) -> bytes:
+    """按原序列化选项将响应编码为一行 JSON。"""
+    return response.model_dump_json().encode() + b"\n"
 
 
 def _coerce_to_schema(params: dict, schema: dict) -> dict:
@@ -100,14 +105,7 @@ class DaemonServer:
                 f.write(str(os.getpid()))
 
             # 信号处理已就绪，连接 MCP 期间也能取消并回收子进程。
-            configs = self.mcp_provider.load_config()
-            if configs:
-                tools = await self.mcp_provider.connect_all(configs)
-                for tool_meta in tools:
-                    self.registry.register(tool_meta)
-                logger.info(
-                    "Loaded %d tools from %d MCP server(s)", len(tools), len(configs)
-                )
+            await self._load_mcp_tools()
 
             server = await asyncio.start_unix_server(
                 self._handle_client, path=SOCKET_PATH, limit=STREAM_LIMIT
@@ -136,6 +134,17 @@ class DaemonServer:
                 for sig in (signal.SIGTERM, signal.SIGINT):
                     loop.remove_signal_handler(sig)
                 self._run_task = None
+
+    async def _load_mcp_tools(self) -> None:
+        """直接登记导入的定义，返回后释放临时目录列表的引用。"""
+        configs = self.mcp_provider.load_config()
+        if configs:
+            tools = await self.mcp_provider.connect_all(configs)
+            for tool_meta in tools:
+                self.registry.register(tool_meta)
+            logger.info(
+                "Loaded %d tools from %d MCP server(s)", len(tools), len(configs)
+            )
 
     async def _idle_watchdog(self) -> None:
         """定期检查 idle 状态，超时则自动关闭 daemon。"""
@@ -171,13 +180,14 @@ class DaemonServer:
                     req = DaemonRequest.model_validate_json(line)
                     if req.method not in _IDLE_EXEMPT_METHODS:
                         self._last_activity = time.monotonic()
-                    resp = await self._dispatch(req)
+                    payload = await self._dispatch(req)
                 except Exception as e:
                     method = req.method if req else "<invalid>"
                     logger.exception("Error processing request: %s", method)
-                    resp = DaemonResponse.fail(f"{type(e).__name__}: {e}")
-
-                writer.write(resp.model_dump_json().encode() + b"\n")
+                    payload = _encode_response(
+                        DaemonResponse.fail(f"{type(e).__name__}: {e}")
+                    )
+                writer.write(payload)
                 await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             logger.debug("Client connection dropped")
@@ -198,37 +208,55 @@ class DaemonServer:
             self._validators[full_name] = validator
         return self._validators[full_name]
 
-    async def _dispatch(self, req: DaemonRequest) -> DaemonResponse:
-        """路由请求到对应处理方法。"""
+    async def _dispatch(self, req: DaemonRequest) -> bytes:
+        """文档生成与编码交给同一个工作线程，其他方法仍由异步处理器执行。"""
+        if req.method in self._DOCUMENTATION_HANDLERS:
+            return await asyncio.to_thread(self._encode_documentation, req)
         handler = self._HANDLERS.get(req.method)
-        if handler is None:
-            return DaemonResponse.fail(f"Unknown method: {req.method}")
-        return await handler(self, req)
+        response = (
+            await handler(self, req)
+            if handler is not None
+            else DaemonResponse.fail(f"Unknown method: {req.method}")
+        )
+        # shutdown 已请求取消服务任务，必须在下一次让出执行权之前完成确认响应的编码。
+        return _encode_response(response)
 
-    async def _handle_list_tools(self, req: DaemonRequest) -> DaemonResponse:
+    def _encode_documentation(self, req: DaemonRequest) -> bytes:
+        """在同一个工作线程内生成文档并编码，避免阻塞请求事件循环。"""
+        return _encode_response(self._DOCUMENTATION_HANDLERS[req.method](self, req))
+
+    def _list_tools(self, req: DaemonRequest) -> DaemonResponse:
         tools = self.registry.list_all()
-        return DaemonResponse.success([t.model_dump(exclude_none=True) for t in tools])
-
-    async def _handle_search(self, req: DaemonRequest) -> DaemonResponse:
-        results = self.registry.search(req.query or "", top_k=req.top_k)
+        if req.catalog_servers is not None:
+            servers = set(req.catalog_servers)
+            tools = [tool for tool in tools if tool.server in servers]
+        include = None
+        if req.catalog_view == "summary":
+            include = set(ToolInfo.model_fields)
         return DaemonResponse.success(
-            [r.model_dump(exclude_none=True) for r in results]
+            [t.model_dump(include=include, exclude_none=True) for t in tools]
         )
 
-    async def _handle_grep(self, req: DaemonRequest) -> DaemonResponse:
-        results = self.registry.grep(req.query or "", top_k=req.top_k)
-        return DaemonResponse.success(
-            [r.model_dump(exclude_none=True) for r in results]
-        )
+    def _search(self, req: DaemonRequest) -> DaemonResponse:
+        results = self.registry.search(req.query or "", req.top_k, tool=req.tool_name)
+        return DaemonResponse.success(results)
 
-    async def _handle_describe(self, req: DaemonRequest) -> DaemonResponse:
+    def _grep(self, req: DaemonRequest) -> DaemonResponse:
+        results = self.registry.grep(req.query or "", req.top_k)
+        return DaemonResponse.success(results)
+
+    def _describe(self, req: DaemonRequest) -> DaemonResponse:
+        """处理单个或批量查看，保留名称顺序与逐工具错误隔离。"""
         if not req.tool_name:
             return DaemonResponse.fail("tool_name required")
-        try:
-            meta = self.registry.resolve(req.tool_name)
-        except ToolResolveError as e:
-            return DaemonResponse.fail(str(e))
-        return DaemonResponse.success(meta.model_dump(exclude_none=True))
+        names = split_names(req.tool_name)
+        descriptions = self.registry.describe_many(
+            names, fields=req.fields, schema=req.full_schema
+        )
+        if len(names) == 1 and isinstance(descriptions[0], ToolDescriptionError):
+            return DaemonResponse.fail(descriptions[0].error)
+        results = [item.model_dump(exclude_unset=True) for item in descriptions]
+        return DaemonResponse.success(results[0] if len(names) == 1 else results)
 
     async def _handle_call_tool(self, req: DaemonRequest) -> DaemonResponse:
         if not req.tool_name:
@@ -283,11 +311,13 @@ class DaemonServer:
         )
         return DaemonResponse.success(status.model_dump())
 
+    _DOCUMENTATION_HANDLERS = {
+        "list_tools": _list_tools,
+        "search": _search,
+        "grep": _grep,
+        "describe": _describe,
+    }
     _HANDLERS = {
-        "list_tools": _handle_list_tools,
-        "search": _handle_search,
-        "grep": _handle_grep,
-        "describe": _handle_describe,
         "call_tool": _handle_call_tool,
         "shutdown": _handle_shutdown,
         "status": _handle_status,

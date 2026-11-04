@@ -10,10 +10,10 @@ axi 将已有 MCP server 和 Python 函数接入同一套工具接口。API、�
 
 当 MCP 客户端把所有工具定义预先提供给模型时，即使一次任务只用 30 个工具中的一两个，其余工具的描述和参数 schema 仍会占据上下文。低频工具也会带来持续的 token 开销。
 
-axi 采用**渐进式披露（Progressive Disclosure）**：工具保存在 axi 的注册表中，Agent 需要某项能力时再搜索，只读取候选工具的完整参数。
+axi 采用**渐进式披露（Progressive Disclosure）**：工具保存在 axi 的注册表中，Agent 需要某项能力时再搜索，按需查看候选工具的参数和输出定义；信息足够时直接调用。
 
 ```text
-search / grep → 工具摘要 → describe → 参数 schema → run
+search / grep → 工具与字段摘要 → 按需 describe → run / Python 分析
 ```
 
 通过 CLI 使用时，无需把这些工具逐个注册到模型的工具列表；偏好 MCP 的 Agent 可以只接入 `search / grep / describe / run` 四个元工具。发现结果、选中工具的 schema 和执行结果仍会进入上下文，但无需预先加载整个工具集。
@@ -153,7 +153,7 @@ uv run --with axi-cli python batch.py
 
 `tool("server/name")` 接受关键字参数，成功直接返回工具数据，失败抛出 `RuntimeError`，不返回 CLI 的 `status/data` 信封。首次调用自动发现 `nativeTools` 和已安装包的 `axi.native_tools` entry points；原生工具在当前进程执行，MCP 工具通过 daemon 执行。同一脚本可以获取多个工具句柄，将前一个工具的结果交给下一个工具。
 
-批量处理前先通过 `describe` 查看输出示例或查阅工具契约；缺少返回结构时，可对只读工具做一次小规模调用确认。并发数按上游限流和工具状态约束设置，有顺序依赖的调用按顺序执行。
+编写批量脚本前，利用命中字段文档或已有契约确定数据位置与类型；需要更多参数、输出结构或示例时再 `describe`。缺少返回结构时，可对只读工具做一次小规模调用确认。并发数按上游限流和工具状态约束设置，有顺序依赖的调用按顺序执行。
 
 ### 4. 导出为 MCP
 
@@ -169,6 +169,72 @@ axi mcp --server orders --meta
 ```
 
 无需再写一份 MCP server。
+
+## 输出字段文档与检索
+
+`output_schema` 是可选的正常成功业务结果文档，仅用于搜索和查看。
+原生工具通过 `@tool(output_schema=...)` 提供 Pydantic 2 模型类或 JSON Schema 字典；
+外部 MCP 工具优先读取工具清单的 `outputSchema`，否则读取 `_meta["axi/output_schema"]`。
+模型按 serialization 模式转换，字典直接沿用，由注册方保证与实际结果一致；定义更新须重新注册。
+
+```python
+from axi import tool
+from pydantic import BaseModel, Field
+
+class Statistics(BaseModel):
+    backwardMileage: float = Field(description="后退里程，单位米")
+
+class VehicleRecord(BaseModel):
+    plateNumber: str = Field(description="车辆编号")
+    summaryStatistic: Statistics
+
+class VehicleStatisticsOutput(BaseModel):
+    vehicles: list[VehicleRecord]
+
+@tool(
+    name="query_vehicle_statistics",
+    description="查询指定期间的逐车行驶统计。",
+    output_schema=VehicleStatisticsOutput,
+)
+def query_vehicle_statistics(start: str, end: str) -> dict:
+    return {"vehicles": []}
+```
+
+search、grep 使用并返回同一份字段文本，例如：
+
+```json
+{
+  "name": "query_vehicle_statistics",
+  "matched_fields": [
+    "$.vehicles[*].summaryStatistic.backwardMileage: float；后退里程，单位米"
+  ]
+}
+```
+
+Schema 描述完整正常业务返回，JSONPath 的 `$` 不包含 AXI CLI 外层信封，业务自身的 data/result 层级保留。
+路径支持数组模板 `[*]`、固定元组位置 `[n]` 及特殊字段名 `$["a.b"]`；AXI 不自动解码或处理真实数据。
+
+```bash
+axi search "车辆 后退里程" -k 3
+axi describe query_vehicle_statistics
+axi search "后退里程" --tool query_vehicle_statistics
+axi describe query_vehicle_statistics --fields '["$.vehicles[*].summaryStatistic"]'
+axi describe query_vehicle_statistics --schema
+axi run query_vehicle_statistics --json '{"start":"2026-01-01","end":"2026-01-02"}'
+```
+
+按当前缺口选择命令，无需每次依次执行。`describe(name, fields=None, schema=False)` 默认返回业务说明和完整入参，不准备输出文档。
+传入 fields 数组则只查看输出：`["$"]` 查看根下一级，具体路径查看所选节点下一级，`[]` 返回空输出视图。
+显式深层路径始终可见，父子范围取并集。已知工具可用 search 的 tool 参数定位字段，沿用 maxFields 摘要上限。
+`output_fields` 是阅读用字符串，Agent 据此编写脚本处理真实数据，不解析说明文本。
+输出定义未登记时明确返回 `not_registered`。同时需要入参和输出时，可以并行发出两次 describe 请求。
+需要完整输出结构或约束时用 `--schema`（Python：`schema=True`），直接返回已登记的标准 JSON Schema，不查询业务数据；不能与非 null 的 fields 同用。
+
+候选推荐与字段摘要见[检索规则](docs/output-format.md#search-检索)，
+选择、组合、未知路径提示见[查看规则](docs/output-format.md#describe-查看)。
+
+输出定义不改变工具签名、执行或真实返回，不增加校验、裁剪、保存结果或脚本重试。
+动态字典可以不声明；必要单位和业务范围写入字段自身的 description，不另维护一份字段清单。
 
 ## 将已有 MCP 转为 CLI / PTC
 
@@ -216,7 +282,7 @@ axi run jina/jina_search --query "python async" --count 3
 }
 ```
 
-客户端需能找到 `axi` 可执行文件；必要时使用其绝对路径。指定 `--server a,b` 时默认平铺，单组工具使用裸工具名，多组工具加 `server__` 前缀；`--flat / --meta` 可以覆盖默认模式。
+客户端需能找到 `axi` 可执行文件；必要时使用其绝对路径。指定 `--server a,b` 时默认平铺，单组工具使用裸工具名，多组工具加 `server__` 前缀；含输出定义时额外提供 `axi_describe`，按实际导出名查看字段文档，输出定义放在 AXI `_meta` 中；`--flat / --meta` 可以覆盖默认模式。
 
 HTTP 导出使用 `axi mcp --transport http --port 8321`，默认监听 `127.0.0.1`，端点为 `/mcp`。原生工具通过 `axi.env("API_KEY")` 读取变量时，优先使用当前请求的 `Axi-API-KEY` header，其次使用进程环境变量；CLI / stdio 下读取进程环境变量。
 
@@ -224,49 +290,42 @@ HTTP 导出使用 `axi mcp --transport http --port 8321`，默认监听 `127.0.0
 
 | 命令 | 用途 |
 |---|---|
-| `axi search <query> -k 5` | 按能力描述搜索工具，默认 BM25，可配置 embedding |
-| `axi grep <pattern> -l 10` | 用正则匹配工具完整名和描述 |
+| `axi search <query> -k 5` | 搜索工具能力及输出字段；Native 使用 BM25，MCP 可配置 embedding |
+| `axi grep <pattern> -l 10` | 全文正则匹配工具名、描述及共享字段文档 |
 | `axi list [server]` | 枚举工具组；可用逗号指定多组 |
-| `axi describe <tool>` | 查看完整输入 schema 和可选输出示例；支持逗号分隔批量查看 |
+| `axi describe <tool>` | 默认查看入参；用 `--fields` 数组只查看所选输出下一级，支持批量 |
 | `axi run <tool> --key value` | 执行工具；复杂参数用 `-j '{"key":"value"}'` |
 | `axi mcp` | 导出为 MCP server，支持 stdio / HTTP |
 | `axi doctor` | 检查配置、工具来源、daemon、MCP 连接及 embedding 配置 |
 | `axi daemon start / status / stop` | 管理或检查后台连接进程 |
 
 工具命令输出 JSON。`axi run` 成功返回 `{"status":"success","data":...}`，失败返回 `{"status":"error","error":"..."}`；自动化处理要检查 `status`，工具执行失败不一定产生非零退出码。`daemon start / stop` 输出状态文本，`--help` 输出命令帮助。
+远程发现失败的提示写入 stderr，stdout 的 JSON 可独立解析。
 
 `--key value` 按目标输入 schema 解析：字符串字段保留原文，其他字段尝试解析 JSON 数字、布尔值、数组和对象。嵌套数据或需要明确类型时，用 `--json / -j` 传完整 JSON 对象。
 
 ## 搜索与运行配置
 
-`search` 默认使用 BM25 关键词检索，支持中英文分词；`grep` 使用正则，不调用 embedding。可在配置中添加：
+`search` 默认使用 BM25 关键词检索，支持中英文分词；`grep` 使用正则，不调用 embedding。需要语义检索时，在 `axi.json` 中配置：
 
 ```json
-{
-  "search": {
-    "embedding": {"provider": "jina"}
-  },
-  "daemon": {
-    "idleTimeoutMinutes": 30,
-    "requestTimeout": 120
-  }
-}
+{"search":{"embedding":{"provider":"jina"}}}
 ```
 
-- embedding 支持 `jina / openai`，密钥可分别从 `JINA_API_KEY / OPENAI_API_KEY` 读取；配置后在支持的索引上通过 RRF 融合 BM25 与向量检索。
-- 当前 CLI 的原生工具使用本地 BM25 索引，MCP 工具使用 daemon 索引；结果按原生在前、MCP 在后合并，`-k / -l` 分别作用于两端，合并后可能超过指定数量。MCP 元工具模式使用合并索引，支持对两种来源统一做混合搜索。
-- MCP 调用经 daemon 保持长连接，支持有状态 server。需要访问 daemon 的命令会自动启动它；默认空闲 30 分钟关闭。`status: starting` 表示正在初始化，`status: running` 表示已就绪。
-- 每个配置文件路径对应独立 daemon，运行文件位于 `~/.axi/daemons/<hash>.sock / .pid / .log`。配置在进程启动时加载；MCP 配置修改后执行 `axi daemon stop`，已启动的 `axi mcp` 服务也需要重启。
-- 单个 daemon 请求默认等待 120 秒；可用 `daemon.requestTimeout` 或环境变量 `AXI_REQUEST_TIMEOUT` 调整。
+CLI Native 保持 BM25；daemon MCP 和 MCP meta 按配置启用 Embedding。provider、密钥、模型、端点与权重见[搜索配置](docs/configuration.md#search)。
+`search.maxFields` 默认8，0仅隐藏命中字段摘要；目录数量边界、双路推荐及摘要顺序见[检索规则](docs/output-format.md#search-检索)。
+
+MCP 调用经自动启动的 daemon 保持长连接。空闲退出、请求超时和环境变量见[daemon 配置](docs/configuration.md#daemon)，状态与排障见[使用指南](docs/guide.md#daemon-与排障)。
+配置在进程启动时加载；修改 MCP 连接或搜索配置后执行 `axi daemon stop`，已启动的 `axi mcp` 服务也需要重启。
 
 ## Agent skills 与更多文档
 
-仓库提供两个可供 Agent 加载的技能目录；复制到所用 Agent 支持的 skills 目录时，保留目录内的 `references/`：
+仓库提供两个可供 Agent 加载的技能目录，不包含在 Python wheel 中；复制到所用 Agent 支持的 skills 目录时，保留目录内的 `references/`：
 
 - [axi-use](skills/axi-use/SKILL.md)：发现和调用已有工具，按任务选择 CLI 或 Python PTC。
 - [axi-creator](skills/axi-creator/SKILL.md)：封装函数 / API、接入 MCP，以及打包和导出工具。
 
-更多内容见 [使用指南](docs/guide.md)、[配置字段参考](docs/configuration.md)和[架构说明](docs/architecture.md)。命令参数以 `axi <command> --help` 为准。
+更多内容见 [使用指南](docs/guide.md)、[配置字段参考](docs/configuration.md)、[架构说明](docs/architecture.md)和[设计取舍](docs/design.md)。命令参数以 `axi <command> --help` 为准。
 
 ## License
 

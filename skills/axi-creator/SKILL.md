@@ -12,7 +12,7 @@ description: 将 Python 函数、HTTP API 或 SDK 封装为 axi 工具，接入�
 | 起点与目标 | 做法 | 按需参考 |
 |---|---|---|
 | Python 函数、HTTP API、第三方 SDK | 用 `@tool` 包装，通过 `nativeTools` 加载 | 下方最小示例 |
-| 需要枚举、嵌套输入、参数约束或分发 Python 包 | 类型注解 / Pydantic，或 `axi.native_tools` entry points | [原生工具参考](references/native-tools.md) |
+| 需要嵌套输入、输出字段文档、参数约束或分发 Python 包 | 类型注解 / Pydantic，或 `axi.native_tools` entry points | [原生工具参考](references/native-tools.md) |
 | 已有 MCP server，需要 CLI / PTC 入口 | 在当前配置中添加 `mcpServers` | [MCP 接入与导出](references/mcp.md) |
 | 工具已经注册，需要 MCP 客户端访问 | `axi mcp` 元工具或平铺模式 | [MCP 接入与导出](references/mcp.md) |
 
@@ -61,10 +61,11 @@ export AXI_CONFIG="/absolute/path/to/axi.json"
 ## 让工具可发现、可组合
 
 - 用明确的参数名和类型注解生成输入 schema；必填参数无默认值，可省略参数提供默认值。是否可传 `None` 与是否可省略是两回事。
-- 工具的 description 写清能力、业务对象和适用条件，包含用户可能搜索的词。当前搜索索引使用完整工具名和工具级描述，不索引参数字段的描述。
+- 工具的 description 写清能力、业务对象和适用条件，包含用户可能搜索的词。搜索索引使用完整工具名、工具级描述和已声明的输出字段文档；不索引输入参数描述。
 - 参数含义和约束用类型、枚举及 `Field(description=...)` 表达，帮助 Agent 读取 schema 后正确传参。
+- 按需通过 `@tool(output_schema=...)` 声明完整正常成功业务返回，接受 Pydantic 2 模型类或 JSON Schema 字典；只为固定属性、数组元素模板和元组位置提供路径、类型与自身说明。工具作者保证与实际输出一致，不合入错误返回分支。具体规则见 [原生工具参考](references/native-tools.md)。
 - 返回稳定、可序列化的结构；可用 `output_example` 展示形状，减少 PTC 编写前的探测。它是示例，不是返回值校验器，返回类型注解也不会自动成为输出 schema。
-- 工具成功返回业务数据，axi 负责 CLI / 元工具 run 的信封。不要额外套一层相同信封；执行失败抛出有意义的异常，避免把失败伪装为正常数据。
+- 工具成功返回业务数据，axi 负责 CLI / 元工具 run 的信封。输出定义只参与搜索和查看，不校验、转换或裁剪实际结果。不要额外套一层相同信封；执行失败抛出有意义的异常，避免把失败伪装为正常数据。
 - 凭据从环境读取；需支持 HTTP 导出时的请求级变量，使用 `axi.env("API_KEY")`。保持 import 阶段只定义工具，把网络请求等执行逻辑留在函数调用中。
 
 ## 验证实际使用路径
@@ -76,6 +77,8 @@ axi search "区域 订单"
 axi describe orders/query_orders
 axi run orders/query_orders --region cn --limit 5
 ```
+
+为上面的工具登记 `output_schema` 后，再用 `axi describe orders/query_orders --fields '["$.orders"]'` 核对输出字段；仅提供 `output_example` 不会生成字段文档。
 
 Python PTC 也应获得相同数据：
 

@@ -6,7 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from axi.config import AXI_HOME, CONFIG_HASH
-from axi.models import ResultEnvelope
+from axi.models import DescribeOptions, ResultEnvelope
 
 # 每份配置对应一个独立 daemon，socket/pid/log 按配置路径 hash 隔离
 SOCKET_DIR = str(AXI_HOME / "daemons")
@@ -17,18 +17,31 @@ LOCK_PATH = os.path.join(SOCKET_DIR, f"{CONFIG_HASH}.lock")
 
 # 请求与响应都是单行 JSON，双方使用相同的读取上限。
 STREAM_LIMIT = 8 * 1024 * 1024
+CatalogView = Literal["full", "summary"]
 
 
-class DaemonRequest(BaseModel):
+class DaemonRequest(DescribeOptions):
     """daemon 请求。"""
 
     method: Literal[
-        "list_tools", "call_tool", "search", "grep", "describe", "shutdown", "status"
+        "list_tools",
+        "call_tool",
+        "search",
+        "grep",
+        "describe",
+        "shutdown",
+        "status",
     ] = Field(description="方法名")
     tool_name: str | None = Field(default=None, description="工具完整名称")
     params: dict[str, Any] | None = Field(default=None, description="调用参数")
     query: str | None = Field(default=None, description="搜索关键词")
     top_k: int = Field(default=5, description="搜索结果数量")
+    catalog_view: CatalogView = Field(
+        default="full", description="list_tools 返回完整定义或工具摘要"
+    )
+    catalog_servers: list[str] | None = Field(
+        default=None, description="list_tools 的 server 范围；null=全部，[]=空目录"
+    )
 
 
 class DaemonStatus(BaseModel):

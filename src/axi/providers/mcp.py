@@ -13,11 +13,12 @@ from mcp.client.streamable_http import (
     create_mcp_http_client,
     streamable_http_client,
 )
-from mcp.types import PaginatedRequestParams
+from mcp.types import PaginatedRequestParams, Tool
 from pydantic import Field, model_validator
 
 from axi.config import MCPServerConfig as MCPServerBaseConfig, app_config
 from axi.models import RunResult, ToolMeta, ToolSource
+from axi.output.registration import OUTPUT_SCHEMA_META_KEY, normalize_schema
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,33 @@ class MCPServerConfig(MCPServerBaseConfig):
                 f"MCP server '{self.server}' must have either 'command' or 'url'"
             )
         return self
+
+
+def _import_tool(tool: Tool, server: str) -> ToolMeta:
+    """导入单个工具定义；输出文档不可用时仅忽略文档，保留工具。"""
+    try:
+        schema = normalize_schema(
+            tool.output_schema
+            if tool.output_schema is not None
+            else (tool.meta or {}).get(OUTPUT_SCHEMA_META_KEY)
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "Ignoring output documentation for MCP tool '%s/%s': %s. "
+            "The tool remains available; fix its output definition on the MCP server.",
+            server,
+            tool.name,
+            exc,
+        )
+        schema = None
+    return ToolMeta(
+        name=tool.name,
+        server=server,
+        description=tool.description or "",
+        input_schema=tool.input_schema,
+        output_schema=schema,
+        source=ToolSource.MCP,
+    )
 
 
 class MCPConnection:
@@ -112,16 +140,9 @@ class MCPConnection:
                 if cursor is not None
                 else None
             )
-            for t in response.tools:
-                tools.append(
-                    ToolMeta(
-                        name=t.name,
-                        server=self.config.server,
-                        description=t.description or "",
-                        input_schema=t.input_schema,
-                        source=ToolSource.MCP,
-                    )
-                )
+            tools.extend(
+                _import_tool(tool, self.config.server) for tool in response.tools
+            )
             cursor = response.next_cursor
             if cursor is None:
                 break
@@ -133,7 +154,10 @@ class MCPConnection:
             raise RuntimeError("Not connected")
 
         result = await self.session.call_tool(tool_name, params)
-        # 提取 content 中的文本
+        if not result.is_error and result.structured_content is not None:
+            return result.structured_content
+
+        # 仅在报错或没有结构化结果时提取 content，避免复制未使用的图片等大块内容。
         contents = []
         for block in result.content:
             if hasattr(block, "text"):

@@ -37,9 +37,29 @@ def query_device_data(
 - 嵌套 `BaseModel` 通过 JSON Schema 的定义和引用表达，调用时将输入 dict 转成对应模型实例。
 - `str | None` 允许 null；只有提供默认值才使参数可省略。
 - 未声明字段默认不允许；函数含 `**kwargs` 时允许额外字段，但额外字段不会自动获得明确的 schema。`*args` 不进入参数 schema。面向 Agent 的主要输入应显式声明，支持关键字传参。
-- 工具描述用于发现，参数描述用于 describe；当前 BM25 / embedding 语料只有工具完整名和工具级 description。
-- `output_example` 可经 describe 查看，也会追加到 MCP 平铺工具描述中；它不生成或验证输出 schema。返回值应符合对下游承诺的结构。
+- 工具描述用于发现，参数描述用于 describe；BM25 / embedding 还包含声明的输出字段文档，不索引输入参数描述。
+- `output_example` 可经 `describe(name, fields=["$"])` 查看，也会追加到 MCP 平铺工具描述中；它不生成或验证输出 schema。返回值应符合对下游承诺的结构。
 - 同步和 `async def` 原生函数都可被执行，公开 PTC 句柄仍是同步函数。已有 async 调用方使用 `await asyncio.to_thread(handle, **params)`，避免在事件循环线程内直接调用。
+
+## 输出字段文档
+
+- 通过 `@tool(output_schema=...)` 提供 Pydantic 2 模型类或 JSON Schema 字典。模型按 serialization 模式转换，支持文件模型的延迟注解；更新定义后重新注册，与查询顺序执行。
+- 只描述完整正常成功业务返回，包含实际的 constants/columns/values/page 等层级，不用解码后的单条记录代替返回对象，作者保证声明与实际输出一致，无需合入错误返回。业务故障码、告警和失败数量仍是普通字段；动态字典可省略定义，不枚举实际键名。
+- 每个位置提供 JSONPath、类型与自身 description；对象属性、数组模板 `[*]` 和元组位置 `[n]` 独立检索，不传播祖先说明。含义、单位和必要范围写入对应节点的 description，其他约束不翻译成文案。
+- 本地引用保留目标已有说明，组合保留 anyOf/oneOf/allOf 与分支说明归属；anyOf/allOf 简化重复释义，oneOf 保留分支及嵌套。数组数量约束不删除声明的位置。
+- JSONPath 的 `$` 固定指向完整正常成功业务值；CLI 外层信封不计入，业务自身的 data/result/record 字段保留。
+- describe 返回阅读用文档字符串：展开节点显示子结构，终点显示类型与自身说明。fields 省略或 null 只返回完整入参，传 JSONPath 数组则只返回输出；`["$"]` 查看根目录，`[]` 返回空输出视图。所选节点固定展开一级，数组模板、元组位置与引用/组合不额外增加展开层级。Agent 不解析说明文本。
+- 定义只作搜索和查看，不参与完整 Schema 校验、真实返回校验、转换、裁剪或自动解码，不改变签名和调用行为。工具自行声明的 `output_fields` 仍是普通业务参数。
+- `output_example` 可选，无需重复维护字段清单。示例沿用原有编码，不强制别名或 JSON serializer；fields 省略或 null 时省略输出示例。
+
+```python
+class OrderResult(BaseModel):
+    total: int = Field(description="订单总数，单位条")
+
+@tool(description="查询订单总数", output_schema=OrderResult)
+def count_orders(region: str) -> dict:
+    return {"total": 1}
+```
 
 ## 环境与请求级变量
 

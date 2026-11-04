@@ -2,14 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from axi.models import ToolMeta
+from pydantic import BaseModel
+
 from axi.search.cache import EmbeddingCache, content_hash
 
 if TYPE_CHECKING:
     from axi.config import EmbeddingConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+def warn_embedding_failure(phase: str, exc: Exception) -> None:
+    """统一报告可选 Embedding 的失败原因，保留 BM25 检索。"""
+    logger.warning(
+        "Embedding %s failed; using BM25. "
+        "Check search.embedding in axi.json and provider availability: %s",
+        phase,
+        exc,
+    )
 
 
 @runtime_checkable
@@ -55,11 +70,16 @@ def create_embedding_provider(
     )
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """计算两个向量的余弦相似度。"""
+class _IndexedVector(BaseModel):
+    values: list[float]
+    norm: float
+
+
+def _cosine_similarity(
+    a: list[float], b: list[float], norm_a: float, norm_b: float
+) -> float:
+    """使用预先计算的向量长度，余弦公式沿用原工具搜索实现。"""
     dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return dot / (norm_a * norm_b)
@@ -71,49 +91,54 @@ class EmbeddingSearch:
     def __init__(self, provider: EmbeddingProvider, cache: EmbeddingCache) -> None:
         self._provider = provider
         self._cache = cache
-        self._tools: list[ToolMeta] = []
-        self._vectors: list[list[float]] = []
+        self._vectors: list[_IndexedVector] = []
 
-    def build(self, tools: list[ToolMeta]) -> None:
-        """构建 embedding 索引：优先从缓存读取，缺失的批量调 API。"""
-        self._tools = tools
+    def build_documents(self, texts: list[str]) -> None:
+        """优先复用缓存向量，批量请求并保存缺失向量。"""
         self._vectors = []
+        if not texts:
+            return
 
-        texts = [f"{t.full_name} {t.description}" for t in tools]
         hashes = [content_hash(t) for t in texts]
 
-        # 分离命中/未命中
-        missing_indices: list[int] = []
-        missing_texts: list[str] = []
-        cached_vectors: dict[int, list[float]] = {}
-
-        for i, h in enumerate(hashes):
-            vec = self._cache.get(h)
-            if vec is not None:
-                cached_vectors[i] = vec
-            else:
-                missing_indices.append(i)
-                missing_texts.append(texts[i])
-
-        # 批量请求缺失的 embedding
-        if missing_texts:
-            new_vectors = self._provider.embed_documents(missing_texts)
-            for idx, vec in zip(missing_indices, new_vectors):
-                cached_vectors[idx] = vec
-                self._cache.set(hashes[idx], vec)
+        vectors = {
+            h: vector
+            for h in dict.fromkeys(hashes)
+            if (vector := self._cache.get(h)) is not None
+        }
+        # 相同字段文本共用一个向量，各文档仍保留独立序号和工具归属。
+        missing = {h: text for h, text in zip(hashes, texts) if h not in vectors}
+        if missing:
+            new_vectors = self._provider.embed_documents(list(missing.values()))
+            for h, vector in zip(missing, new_vectors):
+                vectors[h] = vector
+                self._cache.set(h, vector)
             self._cache.save()
+        prepared = {
+            h: _IndexedVector.model_construct(
+                values=vector, norm=math.sqrt(sum(x * x for x in vector))
+            )
+            for h, vector in vectors.items()
+        }
+        self._vectors = [prepared[h] for h in hashes]
 
-        # 按顺序排列
-        self._vectors = [cached_vectors[i] for i in range(len(tools))]
-
-    def search_with_query(self, query: str, top_k: int = 10) -> list[tuple[int, float]]:
-        """搜索，返回 (工具索引, 相似度) 列表。"""
-        if not self._vectors:
+    def search(
+        self, query_vector: list[float], top_k: int = 10
+    ) -> list[tuple[int, float]]:
+        """每次查询对共享向量只计算一次相似度，保留各文档序号及稳定排序。"""
+        if not self._vectors or top_k <= 0:
             return []
-        query_vec = self._provider.embed_query(query)
-        scored = [
-            (i, _cosine_similarity(query_vec, vec))
-            for i, vec in enumerate(self._vectors)
-        ]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [(i, s) for i, s in scored[:top_k] if s > 0]
+        query_norm = math.sqrt(sum(x * x for x in query_vector))
+        similarities: dict[int, float] = {}
+        scored: list[tuple[int, float]] = []
+        for index, vector in enumerate(self._vectors):
+            identity = id(vector.values)
+            score = similarities.get(identity)
+            if score is None:
+                score = _cosine_similarity(
+                    query_vector, vector.values, query_norm, vector.norm
+                )
+                similarities[identity] = score
+            scored.append((index, score))
+        scored.sort(key=lambda hit: hit[1], reverse=True)
+        return [(index, score) for index, score in scored[:top_k] if score > 0]

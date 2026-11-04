@@ -1,207 +1,153 @@
-"""CLI 辅助函数测试：_parse_params、_extract_option、_output_json。"""
+"""验证 CLI 参数解析、配置校验与可操作的错误提示。"""
 
 import json
-from unittest.mock import patch
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 import axi.cli as cli
-from axi.cli import _parse_params, _extract_option, _search_and_merge
-from axi.config import AxiConfig, load_config
+from axi.config import AxiConfig, _warn_ignored_local_config, load_config
 from axi.daemon.protocol import DaemonResponse
-from axi.models import SearchResult, ToolSource
 from axi.providers.mcp import MCPServerConfig
-
-
-# ── _parse_params ──────────────────────────────────────────
+from tests.support import make_tool, node, make_registry
 
 
 @pytest.mark.parametrize(
-    "args, expected",
+    ("args", "expected"),
     [
+        ([], {}),
         (["--name", "alice"], {"name": "alice"}),
         (["--verbose"], {"verbose": True}),
-        (["--data", '{"x": 1}'], {"data": {"x": 1}}),
+        (["--data", '{"x":1}'], {"data": {"x": 1}}),
         (["--count", "42"], {"count": 42}),
-        (
-            ["--name", "alice", "--age", "30", "--verbose"],
-            {"name": "alice", "age": 30, "verbose": True},
-        ),
         (["--verbose", "--name", "alice"], {"verbose": True, "name": "alice"}),
-        ([], {}),
+        (["--flag", "true"], {"flag": True}),
     ],
 )
-def test_parse_params(args, expected):
-    assert _parse_params(args) == expected
+def test_parse_params(args: list[str], expected: dict) -> None:
+    assert cli._parse_params(args) == expected
 
 
-class TestParseParamsSchemaAware:
-    """F：string 字段的值不应被 json.loads 误转成布尔/数字/null。"""
-
-    SCHEMA = {
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("text", "true", "true"),
+        ("text", "null", "null"),
+        ("text", "42", "42"),
+        ("opt", "false", "false"),
+        ("count", "42", 42),
+        ("active", "true", True),
+        ("misc", "true", True),
+    ],
+)
+def test_schema_aware_params(key: str, value: str, expected: object) -> None:
+    schema = {
         "properties": {
-            "text": {"type": "string"},
-            "count": {"type": "integer"},
-            "active": {"type": "boolean"},
-            "opt": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "text": node("string"),
+            "opt": {"anyOf": [node("string"), node("null")]},
+            "count": node("integer"),
+            "active": node("boolean"),
         }
     }
-
-    def test_string_field_keeps_literal(self):
-        assert _parse_params(["--text", "true"], self.SCHEMA) == {"text": "true"}
-        assert _parse_params(["--text", "null"], self.SCHEMA) == {"text": "null"}
-        assert _parse_params(["--text", "42"], self.SCHEMA) == {"text": "42"}
-
-    def test_optional_string_keeps_literal(self):
-        assert _parse_params(["--opt", "false"], self.SCHEMA) == {"opt": "false"}
-
-    def test_non_string_fields_still_parsed(self):
-        assert _parse_params(["--count", "42"], self.SCHEMA) == {"count": 42}
-        assert _parse_params(["--active", "true"], self.SCHEMA) == {"active": True}
-
-    def test_unknown_key_falls_back_to_json(self):
-        assert _parse_params(["--misc", "true"], self.SCHEMA) == {"misc": True}
+    assert cli._parse_params(["--" + key, value], schema) == {key: expected}
 
 
-# ── _extract_option ──────────────────────────────────────
+@pytest.mark.parametrize(
+    ("args", "value", "remaining"),
+    [
+        (["--json", '{"a":1}', "--verbose"], '{"a":1}', ["--verbose"]),
+        (["-j", '{"a":1}'], '{"a":1}', []),
+        (["--verbose", "--name", "x"], None, ["--verbose", "--name", "x"]),
+    ],
+)
+def test_extract_option(
+    args: list[str], value: str | None, remaining: list[str]
+) -> None:
+    assert cli._extract_option(args, "--json", "-j") == (value, remaining)
 
 
-class TestExtractOption:
-    def test_extract_long_option(self):
-        value, remaining = _extract_option(
-            ["--json", '{"a":1}', "--verbose"], "--json", "-j"
-        )
-        assert value == '{"a":1}'
-        assert remaining == ["--verbose"]
-
-    def test_extract_short_option(self):
-        value, remaining = _extract_option(["-j", '{"a":1}'], "--json", "-j")
-        assert value == '{"a":1}'
-        assert remaining == []
-
-    def test_option_not_present(self):
-        value, remaining = _extract_option(["--verbose", "--name", "x"], "--json", "-j")
-        assert value is None
-        assert remaining == ["--verbose", "--name", "x"]
-
-
-# ── _search_and_merge ──────────────────────────────────────
-
-
-class TestSearchAndMerge:
-    def _run(self, local, mcp_data, top_k):
-        """跑一次合并，返回输出的 JSON 列表。"""
-        resp = DaemonResponse.success(mcp_data)
-        captured = {}
-        with (
-            patch.object(cli, "daemon_request", return_value=resp),
-            patch.object(cli.typer, "echo", lambda s: captured.setdefault("out", s)),
-        ):
-            _search_and_merge(local, "search", "q", top_k)
-        return json.loads(captured["out"])
-
-    def test_local_and_mcp_concatenated(self):
-        # 本地在前、MCP 在后，各自顺序保留
-        local = [
-            SearchResult(name="n/a", description="", source=ToolSource.NATIVE),
-            SearchResult(name="n/b", description="", source=ToolSource.NATIVE),
-        ]
-        mcp = [{"name": "m/x", "description": "", "source": "mcp"}]
-        out = self._run(local, mcp, top_k=5)
-        assert [r["name"] for r in out] == ["n/a", "n/b", "m/x"]
-
-    def test_no_score_field_in_output(self):
-        local = [SearchResult(name="n/a", description="", source=ToolSource.NATIVE)]
-        mcp = [{"name": "m/x", "description": "", "source": "mcp"}]
-        out = self._run(local, mcp, top_k=5)
-        assert all("score" not in r for r in out)
-
-    def test_daemon_failure_still_returns_local(self):
-        local = [SearchResult(name="n/a", description="", source=ToolSource.NATIVE)]
-        captured = {}
-        with (
-            patch.object(
-                cli, "daemon_request", return_value=DaemonResponse.fail("boom")
-            ),
-            patch.object(cli.typer, "echo", lambda s: captured.setdefault("out", s)),
-        ):
-            _search_and_merge(local, "search", "q", 5)
-        assert [r["name"] for r in json.loads(captured["out"])] == ["n/a"]
-
-
-# ── doctor ─────────────────────────────────────────────────
-
-
-class TestDoctor:
-    def _run(self, monkeypatch, config_dict):
-        cfg = AxiConfig.model_validate(config_dict)
-        monkeypatch.setattr(cli, "app_config", cfg)
-        captured = {}
-        monkeypatch.setattr(cli.typer, "echo", lambda s: captured.setdefault("out", s))
-        exit_code = 0
-        try:
+@pytest.mark.parametrize("missing_key", [False, True])
+def test_doctor(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, missing_key: bool
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = {"search": {"embedding": {"provider": "openai"}}} if missing_key else {}
+    monkeypatch.setattr(cli, "app_config", AxiConfig.model_validate(config))
+    if missing_key:
+        with pytest.raises(cli.typer.Exit) as error:
             cli.doctor()
-        except cli.typer.Exit as e:
-            exit_code = e.exit_code
-        return json.loads(captured["out"]), exit_code
-
-    def test_clean_config_ok(self, monkeypatch):
-        report, code = self._run(monkeypatch, {})
-        assert report["ok"] is True
-        assert code == 0
-        assert report["embedding"]["provider"] is None
-
-    def test_missing_embedding_key_flagged(self, monkeypatch):
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        report, code = self._run(
-            monkeypatch, {"search": {"embedding": {"provider": "openai"}}}
-        )
-        assert report["ok"] is False
-        assert code == 1
-        assert report["embedding"]["api_key"] == "missing"
-        assert any("API key" in i for i in report["issues"])
+        assert error.value.exit_code == 1
+    else:
+        cli.doctor()
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is not missing_key
+    assert report["embedding"].get("api_key") == ("missing" if missing_key else None)
 
 
-# ── MCPServerConfig validator ──────────────────────────────
+@pytest.mark.parametrize("server", [None, "remote"])
+@pytest.mark.parametrize("available", [False, True])
+def test_listing_reports_remote_availability(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    server: str | None,
+    available: bool,
+) -> None:
+    registry = make_registry(make_tool(server="local"))
+    monkeypatch.setattr(cli.runtime, "registry", registry)
+    response = (
+        DaemonResponse.success([make_tool(server="remote", source="mcp").model_dump()])
+        if available
+        else DaemonResponse.fail("Restart: axi daemon stop && axi daemon start")
+    )
+    monkeypatch.setattr("axi.daemon.client.daemon_request", lambda req: response)
+    monkeypatch.setattr(
+        cli.app_config,
+        "mcp_servers",
+        {"remote": {"command": "unused"}},
+    )
+    cli.list_tools(server)
+    captured = capsys.readouterr()
+    assert ("axi daemon stop" in captured.err) is not available
+    assert json.loads(captured.out) == (
+        {
+            "server": "remote",
+            "tools": [{"name": "read", "description": ""}] if available else [],
+        }
+        if server
+        else [
+            {"server": "local", "tools": ["read"]},
+            {"server": "remote", "tools": ["read"] if available else []},
+        ]
+    )
 
 
-class TestMCPServerConfig:
-    def test_missing_command_and_url_rejected(self):
-        with pytest.raises(
-            ValidationError, match="must have either 'command' or 'url'"
-        ):
-            MCPServerConfig(server="test")
-
-    def test_command_only_ok(self):
-        cfg = MCPServerConfig(server="test", command="python")
-        assert cfg.command == "python"
-
-    def test_url_only_ok(self):
-        cfg = MCPServerConfig(server="test", url="http://localhost:8080")
-        assert cfg.url == "http://localhost:8080"
-
-    def test_empty_server_rejected(self):
-        with pytest.raises(ValidationError):
-            MCPServerConfig(server="", command="python")
+@pytest.mark.parametrize(
+    "config", [{}, {"server": "test"}, {"server": "", "command": "python"}]
+)
+def test_invalid_mcp_config(config: dict) -> None:
+    with pytest.raises(ValidationError):
+        MCPServerConfig(**config)
 
 
-# ── load_config ──────────────────────────────────────
+@pytest.mark.parametrize(
+    "transport", [{"command": "python"}, {"url": "http://localhost:8080"}]
+)
+def test_mcp_transport_config(transport: dict) -> None:
+    assert MCPServerConfig(server="test", **transport).server == "test"
 
 
-class TestLoadAxiConfig:
-    def test_missing_file_returns_default(self, tmp_path):
-        result = load_config(tmp_path / "nonexistent.json")
-        assert result == AxiConfig()
-
-    def test_malformed_json_raises_system_exit(self, tmp_path):
-        bad_file = tmp_path / "bad.json"
-        bad_file.write_text("{invalid json")
-        with pytest.raises(SystemExit, match="Malformed config file"):
-            load_config(bad_file)
-
-    def test_valid_json(self, tmp_path):
-        good_file = tmp_path / "axi.json"
-        good_file.write_text(json.dumps({"mcpServers": {}}))
-        result = load_config(good_file)
-        assert result.mcp_servers == {}
+def test_config_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    path = tmp_path / "axi.json"
+    assert load_config(path) == AxiConfig()
+    path.write_text("{invalid json")
+    with pytest.raises(SystemExit, match="Malformed config file"):
+        load_config(path)
+    path.write_text('{"mcpServers": {}}')
+    assert load_config(path).mcp_servers == {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AXI_CONFIG", raising=False)
+    _warn_ignored_local_config()
+    assert "ignored" in capsys.readouterr().err

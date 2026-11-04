@@ -1,10 +1,11 @@
-"""axi — Agent eXecution Interface."""
+"""axi — Agent 与外部系统之间的统一工具层。"""
 
 import logging
 from typing import Any, Callable
 
 from axi import runtime
 from axi.context import env
+from axi.output.registration import SchemaInput
 from axi.providers.native import ensure_native_tool_modules, register_tool
 
 __all__ = ["tool", "env"]
@@ -20,6 +21,7 @@ def tool(
     output_example: Any | None = None,
     *,
     name: str | None = None,
+    output_schema: SchemaInput | None = None,
 ) -> Callable:
     """装饰器：注册一个 Python 函数为 axi 工具。
 
@@ -38,6 +40,7 @@ def tool(
         and name is None
         and description is None
         and output_example is None
+        and output_schema is None
     ):
         return _make_caller(tool_name)
 
@@ -48,6 +51,7 @@ def tool(
             name=name or tool_name,
             description=description,
             output_example=output_example,
+            output_schema=output_schema,
         )
         runtime.registry.register(meta)
         return func

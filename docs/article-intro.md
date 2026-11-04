@@ -1,5 +1,7 @@
 # axi：让 AI Agent 像人一样用工具
 
+本文介绍设计动机，示例用于说明流程；安装和命令操作见[使用指南](guide.md)，字段搜索与查看的完整约定见[输出字段契约](output-format.md)。
+
 ## Agent 调工具，为什么这么难？
 
 2024 年以来，AI Agent 的能力突飞猛进。从 Claude Code 到 Cursor，从 Devin 到 OpenHands，这些 Agent 已经可以写代码、改 bug、做部署。但有一个问题始终横亘在 Agent 和"真正好用"之间——**Agent 怎么调用外部工具？**
@@ -75,7 +77,7 @@ MCP 生态已经有大量现成的 server——GitHub、Jira、Slack、浏览器
 
 ### 配置
 
-在项目根目录创建 `axi.json`：
+编辑默认的 `~/.axi/axi.json`，或先设置 `AXI_CONFIG=/absolute/path/to/axi.json` 使用项目配置；当前目录的同名文件不会自动加载：
 
 ```json
 {
@@ -101,7 +103,7 @@ axi run jina/jina_search --query "hello world"
 axi run github/list_repos --owner "anthropics"
 ```
 
-不同来源的同名工具不会冲突，命名空间天然隔离。
+不同 server 的工具可以使用相同短名；完整名称跨来源相同时仍有覆盖或调用优先规则，见[配置与架构](architecture.md#registry工具注册中心)。
 
 ### Daemon 长连接
 
@@ -116,7 +118,7 @@ axi CLI ──(Unix socket)──> daemon ──(stdio)──> Jina MCP server
 daemon 的存在对用户是透明的：
 
 - 第一次执行 `axi search` / `axi run` 时，如果 daemon 没启动，**自动启动**
-- daemon 在后台常驻，PID 记录在 `~/.axi/daemon.pid`
+- 每份配置路径对应独立 daemon，PID 位于 `~/.axi/daemons/<hash>.pid`；默认空闲30分钟后退出
 - CLI 通过 Unix domain socket 和 daemon 通信，延迟极低
 - 需要时 `axi daemon stop` 手动停止
 
@@ -178,7 +180,7 @@ axi 的 `@tool`？**三行搞定**：装饰器 + 函数签名 + 返回值。Sche
 
 回到开头提到的痛点——工具数量爆炸吃 context window。
 
-来看一个真实例子。GitHub MCP server 提供了 30+ 个工具：`create_issue`、`list_repos`、`create_pull_request`、`get_file_contents`、`search_code`……每个工具都有名称、描述、完整参数 schema。按传统做法，这 30 个工具的 definition 全量注入 system prompt，轻松吃掉 5000+ token。
+以一份假设的工具目录为例：GitHub MCP server 提供了 30 个工具：`create_issue`、`list_repos`、`create_pull_request`、`get_file_contents`、`search_code`……每个工具都有名称、描述、完整参数 schema。按传统做法，这 30 个工具的 definition 全量注入 system prompt，轻松吃掉 5000+ token。
 
 再加上 Jira MCP（20+ 工具）、Slack MCP（15+ 工具）、一个自定义的内部工具集（10+ 工具）——你的 Agent 还没开口说话，system prompt 里就已经塞了 70 多个工具的 schema，占掉上万 token。
 
@@ -193,17 +195,17 @@ Agent 需要操作 GitHub？先搜：
 ```bash
 $ axi search "issue"
 [
-  {"name": "github/create_issue", "description": "Create a new issue in a GitHub repository.", "source": "mcp"},
-  {"name": "github/list_issues", "description": "List issues in a GitHub repository.", "source": "mcp"},
-  {"name": "github/update_issue", "description": "Update an existing issue.", "source": "mcp"}
+  {"name": "github/create_issue", "description": "Create a new issue in a GitHub repository.", "source": "mcp", "matched_fields": []},
+  {"name": "github/list_issues", "description": "List issues in a GitHub repository.", "source": "mcp", "matched_fields": []},
+  {"name": "github/update_issue", "description": "Update an existing issue.", "source": "mcp", "matched_fields": []}
 ]
 ```
 
-只返回名称 + 一句话描述。70 个工具搜出 3 个相关的，几十 token 搞定。
+返回工具摘要及命中字段文档；output schema 已登记时，`matched_fields` 提供 JSONPath、类型与自身说明，模型可据此编写分析脚本。
 
 ### 第二层：describe — 这个工具怎么用？
 
-锁定目标后，再获取完整 schema：
+锁定目标后，再获取完整入参 schema：
 
 ```bash
 $ axi describe github/create_issue
@@ -241,7 +243,7 @@ $ axi run github/create_issue --owner "myorg" --repo "myapp" --title "Fix login 
 | 传统全量注入 | 70 个全部注入 | ~10000+ token | 每次对话都占 |
 | axi 渐进式 | search 3 个 + describe 1 个 | ~200 token | 仅在需要时 |
 
-**50 倍的差距**。而且传统方式是每次对话都固定占用，axi 是按需获取、用完即走。
+上表是示意预算，不代表实测的固定倍数；实际开销取决于工具说明、命中字段和查看范围。axi 按需披露契约，已经掌握参数和字段时可以直接调用。
 
 这个设计的价值随工具数量增长而放大。10 个工具可能感受不明显，50 个开始难受，100 个以上就是质的区别。当你的 Agent 需要对接多个系统、工具集越来越大的时候，渐进式披露不是锦上添花，而是**必需品**。
 
@@ -353,7 +355,7 @@ PTC 的核心洞察是：**不是所有工具调用都值得一次 LLM round-tri
 
 好看吗？好看。Agent 能解析吗？不好说。下个版本表格格式变了呢？更不好说。
 
-axi 的所有输出统一为**紧凑 JSON**：
+axi 的工具发现、查看与执行返回**紧凑 JSON**；daemon 管理命令可以返回状态文本：
 
 ```json
 [{"name":"task-1","status":"done","description":"Implement auth"},{"name":"task-2","status":"wip","description":"Add tests"}]
@@ -364,11 +366,11 @@ axi 的所有输出统一为**紧凑 JSON**：
 `axi run` 的返回还有统一信封格式：
 
 ```json
-{"status": "success", "data": {...}}
+{"status": "success", "data": {"count": 3}}
 {"status": "error", "error": "工具不存在: foo/bar"}
 ```
 
-Agent 不需要猜"这次执行成功了吗？"——看 `status` 字段就行。配合非零退出码，错误处理变得确定性十足。
+读取 `status` 判断执行结果；业务工具失败不一定产生非零退出码。Python PTC 成功直接返回业务数据，失败抛出 `RuntimeError`。
 
 这看起来是个小事，但对 Agent 的可靠性影响巨大。当你的 Agent 每天要调用上百次工具，输出格式的确定性直接决定了整个系统的稳定性。
 
@@ -411,7 +413,7 @@ axi grep "query_.*"
 
 ### 命名空间隔离
 
-工具名天然带命名空间，不同来源的同名工具不会冲突：
+不同 server 名可以区分短名相同的工具：
 
 ```
 jina/search        ← Jina MCP server 的 search
@@ -419,7 +421,7 @@ github/search      ← GitHub MCP server 的 search
 my_tools/search    ← 自己写的原生 search
 ```
 
-多个 MCP server + 多个原生模块可以自由组合，不用担心命名冲突。
+应为不同工具组选用独立的 server 名。完整名称仍冲突时，CLI/PTC 优先本地；MCP serve 合并目录按 Native、MCP 顺序登记，由后者覆盖。切换入口前核对其有效定义。
 
 ### 参数智能解析
 
@@ -433,7 +435,7 @@ axi run jina/jina_search --query "hello" --count 3
 axi run some_tool -j '{"nested": {"key": "value"}, "list": [1, 2, 3]}'
 ```
 
-`--key value` 格式会自动尝试 JSON 解析——`3` 变数字，`true` 变布尔，解析失败则作为字符串。简单场景零摩擦，复杂场景有兜底。
+`--key value` 根据入参 Schema 解析：字符串字段保持原文，其他字段尝试 JSON 解码，失败则保留字符串。嵌套结构使用 `--json` 明确传递。
 
 ---
 

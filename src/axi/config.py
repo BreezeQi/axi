@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from axi.models import DEFAULT_MAX_FIELDS
+
 logger = logging.getLogger(__name__)
 
 AXI_HOME = Path("~/.axi").expanduser()
@@ -47,7 +49,7 @@ class EmbeddingConfig(BaseModel):
     api_key: str | None = Field(default=None, alias="apiKey", description="API 密钥")
     model: str | None = Field(default=None, description="模型名称")
     base_url: str | None = Field(
-        default=None, alias="baseUrl", description="自定义端点"
+        default=None, alias="baseUrl", description="OpenAI 兼容 API 的自定义端点"
     )
 
     @model_validator(mode="before")
@@ -74,6 +76,12 @@ class SearchConfig(BaseModel):
 
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     weights: SearchWeightsConfig = Field(default_factory=SearchWeightsConfig)
+    max_fields: int = Field(
+        default=DEFAULT_MAX_FIELDS,
+        alias="maxFields",
+        ge=0,
+        description="每个工具最多展示的命中字段数；0 表示不附带字段",
+    )
 
 
 class DaemonConfig(BaseModel):

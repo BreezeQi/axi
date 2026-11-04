@@ -1,22 +1,26 @@
 # axi 配置参考
 
-axi 通过项目根目录的 `axi.json` 文件和环境变量进行配置。
+axi 默认读取 `~/.axi/axi.json`，可用 `AXI_CONFIG` 指定配置文件，部分设置支持环境变量。
 
 ---
 
 ## axi.json
 
-默认路径为项目根目录下的 `axi.json`。配置在进程启动时加载一次，全局共享。
+默认路径为 `~/.axi/axi.json`，不自动读取当前目录的同名文件。配置在进程启动时加载一次，全局共享。
 
 ### 完整结构
 
 ```json
 {
-  "cli": { ... },
-  "mcpServers": { ... },
-  "nativeTools": [ ... ],
-  "search": { ... },
-  "daemon": { ... }
+  "cli": {"rich": false},
+  "mcpServers": {},
+  "nativeTools": [],
+  "search": {
+    "maxFields": 8,
+    "embedding": {},
+    "weights": {"bm25": 0.3, "embedding": 0.7}
+  },
+  "daemon": {"idleTimeoutMinutes": 30, "requestTimeout": 120}
 }
 ```
 
@@ -143,9 +147,24 @@ axi list     # 自动列出 smartlink 的工具，CWD 无需 axi.json
 
 搜索引擎配置。
 
+#### search.maxFields
+
+每个工具最多展示的命中字段数，默认 `8`，允许非负整数。设为 `0` 时仍检索字段，只是不附带字段摘要。
+不限制 `describe` 的字段查看；摘要选择和排序分别见 [search 规则](output-format.md#工具推荐与字段摘要)与 [grep 规则](output-format.md#grep-检索)。
+
+```json
+{
+  "search": {
+    "maxFields": 8
+  }
+}
+```
+
+修改配置后重新运行 CLI；已运行的 daemon/MCP 服务需重启后读取新值。
+
 #### search.embedding
 
-启用 Embedding 语义搜索。不配置则仅使用 BM25 关键词搜索。
+为 daemon MCP 目录和 MCP meta 合并目录启用 Embedding 语义搜索，同一目录的工具路和字段路共用该配置。不配置则仅使用 BM25 关键词搜索；CLI Native 保持 BM25，Python Registry 使用自身配置。
 
 ```json
 {
@@ -163,11 +182,11 @@ axi list     # 自动列出 smartlink 的工具，CWD 无需 axi.json
 | `provider` | string | 是 | — | `"jina"` 或 `"openai"` |
 | `apiKey` | string | 否 | 从环境变量读取 | API 密钥，省略时读 `JINA_API_KEY` / `OPENAI_API_KEY` |
 | `model` | string | 否 | 取决于 provider | 模型名称 |
-| `baseUrl` | string | 否 | — | 自定义 API 端点（OpenAI 兼容格式） |
+| `baseUrl` | string | 否 | — | 仅 `provider="openai"` 使用的自定义 API 端点；Jina 使用 SDK 固定端点 |
 
 #### search.weights
 
-混合搜索 RRF 融合权重。
+启用 Embedding 时，每路 BM25 与 Embedding 的 RRF 融合权重；工具路与字段路共用配置。计算规则见[检索契约](output-format.md#双路检索与排名)。
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -201,8 +220,9 @@ Daemon 进程配置。
 - `<hash>.lock` — 启动文件锁，串行化并发进程对 daemon 的拉起
 
 Embedding 缓存同样按配置隔离，位于 `~/.axi/cache/<hash>.json`。文件内的缓存键还包含
-provider、model、baseUrl 的命名空间；切换模型或端点会重新生成向量，旧缓存不会误用。
-API key 不写入缓存标识。Embedding 网络/限流等 SDK 异常会回退 BM25 搜索。
+`search.embedding` 配置内容的哈希，排除 API key，沿用原有隔离规则。
+Embedding 在配置 Registry 时初始化，初始化失败直接报错；建库（含缓存写入）或查询失败时，记录警告并沿用 BM25 搜索。
+两路共用缓存，各自在补充缺失向量后保存；相同字段文本复用向量，但分别保留工具归属。
 
 ---
 

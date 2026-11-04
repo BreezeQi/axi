@@ -1,85 +1,230 @@
-"""MCP Provider 集成测试。"""
+"""验证真实 stdio 导入与调用，以及远程输出 Schema 仅作文档的边界。"""
 
-import sys
 import asyncio
 import os
 import signal
+import sys
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, Mock
 
+import mcp.types as types
 import pytest
 
-from axi.providers.mcp import MCPProvider, MCPServerConfig, MCPConnection
-from axi.models import ToolSource
+import axi.mcp_serve as serve
+from axi.config import AxiConfig
+from axi.providers.mcp import MCPConnection, MCPProvider, MCPServerConfig
+from tests.support import node, obj, make_registry
+
+GOOD = obj({"answer": node("integer", "Answer")})
 
 
-MOCK_SERVER = str(Path(__file__).parent / "mock_mcp_server.py")
+@pytest.mark.asyncio
+async def test_real_mcp_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = {
+        "mcpServers": {
+            "test": {
+                "command": sys.executable,
+                "args": [str(Path(__file__).with_name("mock_mcp_server.py"))],
+            }
+        }
+    }
+    monkeypatch.setattr(
+        "axi.providers.mcp.app_config", AxiConfig.model_validate(config)
+    )
+    provider = MCPProvider()
+    try:
+        tools = await provider.connect_all(provider.load_config())
+        assert [tool.full_name for tool in tools] == [
+            "test/echo",
+            "test/add",
+            "test/boom",
+        ]
+        assert tools[0].source == "mcp" and tools[0].input_schema["required"] == [
+            "message"
+        ]
+        for name, params, expected in [
+            ("echo", {"message": "hello axi"}, "hello axi"),
+            ("add", {"a": 3, "b": 5}, 8),
+        ]:
+            result = await provider.call_tool("test", name, params)
+            assert result.status == "success" and result.data == expected
+        error = await provider.call_tool("test", "boom", {})
+        assert error.status == "error" and "kaboom" in error.error
+    finally:
+        await provider.close_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "documentation,expected",
+    [
+        ({"output_schema": GOOD}, GOOD),
+        ({"output_schema": {}}, {}),
+        (
+            {"output_schema": GOOD, "meta": {"axi/output_schema": node("string")}},
+            GOOD,
+        ),
+        ({"meta": {"axi/output_schema": GOOD}}, GOOD),
+        ({"output_schema": node("invalid")}, node("invalid")),
+        (
+            {"output_schema": obj({"speed": node("number", minimum="unused")})},
+            obj({"speed": node("number", minimum="unused")}),
+        ),
+        ({"meta": {"axi/output_schema": ["x"]}}, None),
+    ],
+)
+async def test_remote_output_definitions(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    documentation: dict,
+    expected: dict | None,
+) -> None:
+    session = AsyncMock()
+    input_schema = obj({"output_fields": node("string")})
+    session.list_tools.side_effect = [
+        types.ListToolsResult(
+            tools=[
+                types.Tool(name="query", input_schema=input_schema, **documentation)
+            ],
+            next_cursor="more",
+        ),
+        types.ListToolsResult(
+            tools=[
+                types.Tool(
+                    name="other",
+                    input_schema={},
+                    meta={"axi/output_schema": GOOD},
+                )
+            ]
+        ),
+    ]
+    session.call_tool.return_value = types.CallToolResult(
+        content=[types.TextContent(type="text", text="Query succeeded")],
+        structured_content={"answer": 7},
+    )
+
+    async def connect(connection: MCPConnection) -> None:
+        connection.session = session
+
+    monkeypatch.setattr(MCPConnection, "connect", connect)
+    provider = MCPProvider()
+    tools = await provider.connect_all(
+        [MCPServerConfig(server="remote", command="unused")]
+    )
+    try:
+        assert [tool.name for tool in tools] == ["query", "other"]
+        assert tools[0].output_schema == expected
+        assert tools[0].input_schema == input_schema
+        assert tools[1].output_schema == GOOD
+        registry = make_registry(tools[0])
+        for discover in (registry.search, registry.grep):
+            hits = discover("answer")
+            assert ([hit.matched_fields for hit in hits] if hits else []) == (
+                [["$.answer: int；Answer"]] if expected == GOOD else []
+            )
+        result = await provider.call_tool("remote", "query", {})
+        assert result.status == "success" and result.data == {"answer": 7}
+        exported = serve._export_tool("query", tools[0])
+        assert exported.output_schema is None and exported.input_schema == input_schema
+        if expected is not None:
+            assert exported.meta == {"axi/output_schema": expected}
+        else:
+            assert "Ignoring output documentation" in caplog.text
+    finally:
+        await provider.close_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "texts,structured,is_error,expected",
+    [
+        ([], {"answer": 7}, False, {"answer": 7}),
+        (["Query succeeded"], {"answer": 7}, False, {"answer": 7}),
+        (['{"answer":8}'], {"answer": 7}, False, {"answer": 7}),
+        (["Query succeeded"], {}, False, {}),
+        (["Query succeeded"], [1, 2], False, [1, 2]),
+        (["Query succeeded"], 7, False, 7),
+        (["Query succeeded"], False, False, False),
+        (["Query succeeded"], 0, False, 0),
+        (["Query succeeded"], [], False, []),
+        (["first", "second"], {"answer": 7}, False, {"answer": 7}),
+        (['{"answer":7}'], None, False, {"answer": 7}),
+        (["Query succeeded"], None, False, "Query succeeded"),
+        (["first", "second"], None, False, ["first", "second"]),
+        ([], None, False, []),
+        (["Query failed"], {"answer": 7}, True, "Query failed"),
+        ([], {}, True, "Unknown tool error"),
+    ],
+)
+async def test_mcp_result_parsing(
+    texts: list[str], structured: Any, is_error: bool, expected: Any
+) -> None:
+    conn = MCPConnection(MCPServerConfig(server="test", command="unused"))
+    session = AsyncMock()
+    response = types.CallToolResult(
+        content=[types.TextContent(type="text", text=text) for text in texts],
+        structured_content=structured,
+        is_error=is_error,
+    )
+    session.call_tool.return_value = response
+    conn.session = session
+    provider = MCPProvider()
+    provider._connections["test"] = conn
+
+    result = await provider.call_tool("test", "query", {})
+    if is_error:
+        assert result.status == "error" and result.error == expected
+    else:
+        assert result.status == "success" and result.data == expected
+        if structured is not None:
+            assert result.data is response.structured_content
+    session.call_tool.assert_awaited_once_with("query", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "structured,is_error,expected,render_calls",
+    [
+        ({"answer": 7}, False, {"answer": 7}, 0),
+        ({}, False, {}, 0),
+        ({"answer": 7}, True, "Image content", 1),
+        (None, False, "Image content", 1),
+    ],
+)
+async def test_mcp_result_only_formats_display_content_when_needed(
+    monkeypatch: pytest.MonkeyPatch,
+    structured: dict[str, Any] | None,
+    is_error: bool,
+    expected: Any,
+    render_calls: int,
+) -> None:
+    render = Mock(return_value="Image content")
+    monkeypatch.setattr(types.ImageContent, "__str__", render)
+    conn = MCPConnection(MCPServerConfig(server="test", command="unused"))
+    conn.session = AsyncMock()
+    conn.session.call_tool.return_value = types.CallToolResult(
+        content=[types.ImageContent(type="image", data="AAAA", mime_type="image/png")],
+        structured_content=structured,
+        is_error=is_error,
+    )
+    provider = MCPProvider()
+    provider._connections["test"] = conn
+
+    result = await provider.call_tool("test", "query", {})
+    assert result.status == ("error" if is_error else "success")
+    assert (result.error if is_error else result.data) == expected
+    assert render.call_count == render_calls
+    conn.session.call_tool.assert_awaited_once_with("query", {})
 
 
 @pytest.fixture
-def mock_config():
+def mock_config() -> MCPServerConfig:
     return MCPServerConfig(
         server="test-server",
         command=sys.executable,
-        args=[MOCK_SERVER],
+        args=[str(Path(__file__).with_name("mock_mcp_server.py"))],
     )
-
-
-@pytest.mark.asyncio
-async def test_mcp_connect_and_list_tools(mock_config):
-    conn = MCPConnection(mock_config)
-    try:
-        await conn.connect()
-        tools = await conn.list_tools()
-        assert len(tools) == 3
-
-        echo_tool = next(t for t in tools if t.name == "echo")
-        assert echo_tool.server == "test-server"
-        assert echo_tool.full_name == "test-server/echo"
-        assert echo_tool.source == ToolSource.MCP
-        assert "message" in echo_tool.input_schema["properties"]
-    finally:
-        await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_mcp_call_tool(mock_config):
-    conn = MCPConnection(mock_config)
-    try:
-        await conn.connect()
-        result = await conn.call_tool("echo", {"message": "hello axi"})
-        assert result == "hello axi"
-
-        result = await conn.call_tool("add", {"a": 3, "b": 5})
-        assert result == 8
-    finally:
-        await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_mcp_provider_connect_all(mock_config):
-    provider = MCPProvider()
-    try:
-        tools = await provider.connect_all([mock_config])
-        assert len(tools) == 3
-
-        result = await provider.call_tool("test-server", "echo", {"message": "test"})
-        assert result.status == "success"
-        assert result.data == "test"
-    finally:
-        await provider.close_all()
-
-
-@pytest.mark.asyncio
-async def test_mcp_tool_error_returns_error_envelope(mock_config):
-    """server 返回 is_error 的结果必须落进 error 信封，不能伪装成 success。"""
-    provider = MCPProvider()
-    try:
-        await provider.connect_all([mock_config])
-        result = await provider.call_tool("test-server", "boom", {})
-        assert result.status == "error"
-        assert "kaboom" in result.error
-    finally:
-        await provider.close_all()
 
 
 @pytest.mark.asyncio
@@ -176,27 +321,3 @@ async def test_inflight_failure_does_not_reconnect_after_shutdown(
     finally:
         await task
         await conn.close()
-
-
-def test_mcp_load_config(monkeypatch):
-    from axi.config import AxiConfig
-
-    mock_config = AxiConfig.model_validate(
-        {
-            "mcpServers": {
-                "my-server": {
-                    "command": "python",
-                    "args": ["server.py"],
-                    "env": {"API_KEY": "xxx"},
-                }
-            }
-        }
-    )
-    monkeypatch.setattr("axi.providers.mcp.app_config", mock_config)
-
-    provider = MCPProvider()
-    configs = provider.load_config()
-    assert len(configs) == 1
-    assert configs[0].server == "my-server"
-    assert configs[0].command == "python"
-    assert configs[0].env == {"API_KEY": "xxx"}

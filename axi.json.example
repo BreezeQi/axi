@@ -11,5 +11,6 @@
             "url": "http://localhost:8000/mcp"
         }
     },
-    "nativeTools": [{"module": "test/test_tool.py"}]
+    "nativeTools": [{"module": "test/test_tool.py"}],
+    "search": {"maxFields": 8}
 }

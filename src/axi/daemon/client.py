@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from typing import Any
 
 from axi.config import CONFIG_PATH, app_config
 from axi.daemon.protocol import (
@@ -19,16 +20,21 @@ from axi.daemon.protocol import (
     DaemonRequest,
     DaemonResponse,
 )
+from axi.models import (
+    DescribeOptions,
+    ToolInfo,
+    ToolMeta,
+)
 
 logger = logging.getLogger(__name__)
 
 # 等待 daemon 就绪的上限。daemon 要先连上所有 MCP server 才创建 socket，
 # 官方 MCP 由 uvx 拉起、首次还要下载依赖，冷启动远超旧的 3 秒窗口。
-_DAEMON_START_TIMEOUT = 60.0  # seconds
-_DAEMON_START_POLL_INTERVAL = 0.1  # seconds
+_DAEMON_START_TIMEOUT = 60.0  # 秒
+_DAEMON_START_POLL_INTERVAL = 0.1  # 秒
 
 # 等待 daemon 退出（关 MCP 连接、删 PID / socket）的上限
-DAEMON_STOP_TIMEOUT = 60.0  # seconds
+DAEMON_STOP_TIMEOUT = 60.0  # 秒
 
 
 def read_live_pid() -> int | None:
@@ -136,6 +142,59 @@ def daemon_request(req: DaemonRequest) -> DaemonResponse:
     return send_request(req)
 
 
+def _documentation_request(request: DaemonRequest) -> Any:
+    """统一处理发现与文档请求的通信失败，业务调用仍沿用原处理。"""
+    try:
+        response = daemon_request(request)
+    except (OSError, ValueError) as exc:
+        detail = str(exc).partition("\n")[0]
+        raise RuntimeError(
+            f"Daemon {request.method} request failed: {detail}. "
+            f"Check daemon log: {LOG_PATH}"
+        ) from exc
+    if response.status == "error":
+        raise RuntimeError(response.error or "")
+    return response.data
+
+
+def fetch_tool_catalog(*, servers: list[str] | None = None) -> list[ToolMeta]:
+    """获取并转换完整工具定义；daemon 请求失败以 RuntimeError 交给调用方。"""
+    data = _documentation_request(
+        DaemonRequest(method="list_tools", catalog_servers=servers)
+    )
+    return [ToolMeta.model_validate(item) for item in data or []]
+
+
+def fetch_tool_summaries(*, servers: list[str] | None = None) -> list[ToolInfo]:
+    """仅获取工具身份和说明，不传输或补造 Schema。"""
+    data = _documentation_request(
+        DaemonRequest(
+            method="list_tools", catalog_view="summary", catalog_servers=servers
+        )
+    )
+    return [ToolInfo.model_validate(item) for item in data or []]
+
+
+def fetch_discovery(request: DaemonRequest) -> list[dict[str, Any]]:
+    """直接使用 search、grep 的响应数据，不额外校验或包装响应。"""
+    return _documentation_request(request) or []
+
+
+def fetch_description(name: str, options: DescribeOptions) -> dict[str, Any]:
+    """逐工具获取说明，保留 daemon 返回的文档或对应错误。"""
+    try:
+        return _documentation_request(
+            DaemonRequest(
+                method="describe",
+                tool_name=name,
+                fields=options.fields,
+                schema=options.full_schema,
+            )
+        )
+    except RuntimeError as exc:
+        return {"error": str(exc) or f"Tool not found: {name}"}
+
+
 async def _send(req: DaemonRequest) -> DaemonResponse:
     try:
         reader, writer = await asyncio.open_unix_connection(
@@ -147,7 +206,7 @@ async def _send(req: DaemonRequest) -> DaemonResponse:
         )
 
     try:
-        writer.write(req.model_dump_json().encode() + b"\n")
+        writer.write(req.model_dump_json(by_alias=True).encode() + b"\n")
         await writer.drain()
 
         timeout = app_config.daemon.request_timeout

@@ -13,9 +13,11 @@ from types import ModuleType
 from typing import Any, Callable, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, create_model
+from pydantic.errors import PydanticUndefinedAnnotation
 
 from axi.config import CONFIG_PATH, NativeToolEntry, app_config
 from axi.models import ToolMeta, ToolSource
+from axi.output.registration import SchemaInput, normalize_schema
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +81,18 @@ def register_tool(
     name: str | None = None,
     description: str | None = None,
     output_example: Any | None = None,
+    output_schema: SchemaInput | None = None,
 ) -> ToolMeta:
     """注册一个原生 Python 函数为 axi 工具。"""
     tool_name = name or func.__name__
     tool_desc = description or func.__doc__ or ""
+    if isinstance(output_schema, type) and issubclass(output_schema, BaseModel):
+        # 先使用模型自身的名称空间；文件模型缺少引用名称时，再补充函数的全局变量。
+        try:
+            output_schema.model_rebuild()
+        except PydanticUndefinedAnnotation:
+            output_schema.model_rebuild(_types_namespace=func.__globals__)
+    normalized = normalize_schema(output_schema)
     model = _build_params_model(func)
 
     meta = ToolMeta(
@@ -90,6 +100,7 @@ def register_tool(
         description=tool_desc,
         input_schema=_extract_input_schema(model),
         output_example=output_example,
+        output_schema=normalized,
         source=ToolSource.NATIVE,
     )
 

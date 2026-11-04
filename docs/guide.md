@@ -1,440 +1,215 @@
 # axi 使用指南
 
-axi（Agent eXecution Interface）是 AI Agent 与外部系统之间的统一工具层。它将 MCP server 和 Python 函数统一为可搜索、可调用的 CLI 命令。
+axi 将 Python 函数和 MCP 工具提供为可发现、可搜索、可编程调用的接口。
+命令参数以 `axi <command> --help` 为准，配置字段见[配置参考](configuration.md)。
 
-## 安装
+## 安装与配置
 
 ```bash
-uv pip install -e .
+# 安装 CLI
+uv tool install axi-cli
+
+# 在 Python 项目中使用 PTC
+uv add axi-cli
 ```
 
-安装后 `axi` 命令即可在终端中使用。
-
----
-
-## 快速开始
+从源码开发时，在仓库根目录执行 `uv sync`，通过 `uv run axi ...` 使用当前代码。
+默认配置是 `~/.axi/axi.json`，不会自动读取当前目录的同名文件。项目配置须显式指定：
 
 ```bash
-# 搜索工具
-axi search "web"
-
-# 查看工具详情
-axi describe jina-mcp-tools/jina_search
-
-# 执行工具
-axi run jina-mcp-tools/jina_search --query "hello world" --count 3
+export AXI_CONFIG="$PWD/axi.json"
 ```
 
----
+CLI 与 Python 使用同一份配置；Python 解释器还须能 `import axi`。
+更改配置后重启对应 daemon 或 MCP 导出进程。
 
-## CLI 命令
+## 发现与查看
 
-所有命令输出统一为紧凑 JSON。
-
-### axi list
-
-列出所有 server 及其工具。
+已知工具及契约时直接调用；缺少信息时按需使用以下命令：
 
 ```bash
-# 列出所有 server 及工具名
 axi list
-
-# 列出指定 server 的工具详情（含描述）
-axi list jina-mcp-tools
+axi list orders,inventory
+axi search "查询订单" -k 3
+axi grep '^orders/' -l 5
+axi describe orders/query_orders
 ```
 
-**参数：**
+### list
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `server_name` | 只列出指定 server 的工具（位置参数） | 全部 |
+不传名称时列出 server 和工具名；指定一个 server 时返回该组工具名称与说明，多个 server 返回分组数组。
+`nativeTools`、已安装包的 `axi.native_tools` entry points 和配置的 MCP server 都可贡献工具。
 
-**输出示例：**
+### search 与 grep
 
-`axi list`：
+search 检索工具名称、说明及输出字段，按相关性推荐；grep 对这些文本做忽略大小写的全文正则匹配，工具按登记顺序返回。
+CLI 分别查询本地 Native 和 daemon MCP 目录，Native 在前直接拼接；`-k`、`-l` 分别限制每份目录，最多返回两倍上限。
+多个 MCP server 共用 daemon 名额，目录之间不补足名额。MCP meta 与 Python Registry 对自身目录整体取上限。
+
+| 命令 | 查询参数 | 数量参数 | 默认上限 |
+| --- | --- | --- | --- |
+| search | `query`，自然语言或字段位置 | `--top-k` / `-k` | 每份目录5个 |
+| grep | `pattern`，正则表达式 | `--limit` / `-l` | 每份目录10个 |
+
+结果包含工具名称、说明、来源、路径根与命中字段，例如：
 
 ```json
-[{"server":"jina-mcp-tools","tools":["jina_reader","jina_search"]},{"server":"retrieval","tools":["search_knowledge"]}]
+[{"name":"orders/query_orders","description":"按区域查询订单","source":"native","matched_fields":["$.orders[*].id: int；订单编号"]}]
 ```
 
-`axi list jina-mcp-tools`：
+CLI Native 使用 BM25；daemon MCP 和 MCP meta 合并目录可通过 `search.embedding` 配置语义检索。
+`search.maxFields` 默认8，0只隐藏摘要，不影响字段召回。完整评分、交错推荐、精确路径及摘要规则见[检索规则](output-format.md#search-检索)。
 
-```json
-{"server":"jina-mcp-tools","tools":[{"name":"jina_reader","description":"Read and extract content from web page."},{"name":"jina_search","description":"Search the web."}]}
-```
+限定已知工具的字段：`axi search "订单编号" --tool orders/query_orders`。复用已有字段排名，只返回该工具的命中摘要，数量仍由 maxFields 控制。
 
-### axi search
-
-搜索已注册的工具。默认使用 BM25 关键词搜索（bm25s + jieba 分词），支持中英文自然语言查询。如果在 `axi.json` 中配置了 Embedding，则自动启用混合搜索（BM25 + Embedding，通过 RRF 融合排序）。返回匹配工具的名称、描述和来源，按相关性降序排列（顺序本身即信号，不含分数：native 与 MCP 来自两套独立索引、分数不可比）。
+### describe
 
 ```bash
-# BM25 关键词搜索（默认）
-axi search "读取"
+# 业务说明和完整入参；省略 fields 或传 null 均不处理输出文档
+axi describe orders/query_orders
 
-# 正则匹配
-axi grep "read_.*"
+# 浏览输出根目录
+axi describe orders/query_orders --fields '["$"]'
 
-# 限制返回数量
-axi search "web" --top-k 5
+# 查看两个已知字段
+axi describe orders/query_orders --fields '["$.orders[*].id","$.total"]'
+
+# 浏览容器的直接子字段，下一层容器保留紧凑释义
+axi describe orders/query_orders --fields '["$.orders"]'
+
+# 需要完整输出结构、分支或约束时读取已登记的标准 Schema，不查询业务数据。
+axi describe orders/query_orders --schema
+
+# 空输出视图，不返回入参
+axi describe orders/query_orders --fields '[]'
+
+# 批量查看，保留名称顺序与逐项错误
+axi describe orders/query_orders,inventory/get_stock
 ```
 
-**search 参数：**
+`--fields` 为输出定义的 JSONPath 数组；省略或 null 查看入参，非 null 数组只查看输出。
+输出选择固定展开一级，显式深层路径仍可见，不提供单次查看全部层级的参数。
+优先通过 search、grep 获取路径与完整说明；已知工具可用 `axi search "订单编号" --tool orders/query_orders` 定位字段，信息足够时直接调用。
+需要同时查看入参和输出时，分别发出不带 fields 和 `--fields '["$"]'` 的请求，可以并行。
 
-| 参数 | 缩写 | 说明 | 默认值 |
-|------|------|------|--------|
-| `query` | - | 搜索关键词（位置参数） | 必填 |
-| `--top-k` | `-k` | 返回结果数量 | 10 |
+`output_fields` 是阅读用文档字符串，外层响应仍是 JSON；Agent 按 JSONPath 访问业务数据，不解析说明文本。
+输出定义未登记时标记 `not_registered`；未知路径返回 `unknown_fields` 和最近有效父节点的 `available_fields`。
+选择并集、数组、元组、组合及递归规则见[输出字段契约](output-format.md)。
 
-**grep 参数：**
+使用当前入口发现的完整名称调用。CLI/PTC 优先本地；MCP meta 使用其合并目录的有效定义。
+完整名称跨来源冲突时，不保证不同入口选中同一定义，切换入口前应重新确认。
 
-| 参数 | 缩写 | 说明 | 默认值 |
-|------|------|------|--------|
-| `pattern` | - | 正则表达式（位置参数） | 必填 |
-| `--top-k` | `-k` | 返回结果数量 | 10 |
+## 调用
 
-**输出示例：**
+### CLI
+
+```bash
+axi run orders/query_orders --region cn --limit 5
+axi run orders/query_orders --json '{"region":"cn","limit":5}'
+```
+
+`--key value` 按入参 Schema 解析：字符串字段保留原文，其他字段尝试 JSON 解码，失败则保留字符串。
+`--json` / `-j` 用于完整对象或嵌套参数。
 
 ```json
-[{"name":"jina-mcp-tools/jina_reader","description":"Read and extract content from web page.","source":"mcp"}]
+{"status":"success","data":{"orders":[],"total":0}}
 ```
 
-**Embedding 搜索配置：**
+```json
+{"status":"error","error":"Invalid params: ..."}
+```
 
-在 `axi.json` 中添加 `search.embedding` 字段即可启用混合搜索：
+读取 `status` 判断执行结果；业务工具失败不一定产生非零退出码。搜索返回摘要数组，describe 返回文档，不能将所有命令输出都当作 run 信封。
+
+### Python PTC
+
+```python
+from axi import tool
+
+query = tool("orders/query_orders")
+result = query(region="cn", limit=5)
+# result 是业务数据本身；失败抛出 RuntimeError
+```
+
+沿用同一调用句柄进行批量查询，在脚本中关联、过滤或聚合完整业务结果：
+
+```python
+results = [query(region=region, limit=5) for region in ("cn", "jp")]
+orders = [order for result in results for order in result["orders"]]
+total_amount = sum(order["amount"] for order in orders)
+```
+
+句柄是同步函数。原生工具在当前进程执行，MCP 工具经 daemon 调用，无需为每次调用启动 CLI。
+需要并发或接入已有 async 程序时，将同步句柄交给线程，并按上游限制控制并发：
+
+```python
+import asyncio
+from axi import tool
+
+query = tool("orders/query_orders")
+
+async def read_orders():
+    return await asyncio.to_thread(query, region="cn", limit=5)
+
+result = asyncio.run(read_orders())
+```
+
+已有事件循环时直接在 async 函数中使用 `await asyncio.to_thread(...)`，不要嵌套 `asyncio.run()`。
+返回结构明确时直接编写分析脚本；信息不足时查看定义，必要时对只读工具小规模试调。
+
+## 接入工具
+
+MCP 在当前配置的 `mcpServers` 中声明；Python 模块在 `nativeTools` 中声明，或由已安装包的 entry points 提供：
 
 ```json
 {
-    "mcpServers": { ... },
-    "search": {
-        "embedding": {
-            "provider": "jina",
-            "apiKey": "jina_xxx",
-            "model": "jina-embeddings-v3",
-            "baseUrl": "https://api.jina.ai/v1"
-        }
-    }
+  "mcpServers": {
+    "retrieval": {"url":"http://127.0.0.1:8020/mcp"}
+  },
+  "nativeTools": [
+    {"module":"my_project.tools"},
+    {"module":"./scripts/tools.py","name":"scripts"}
+  ]
 }
 ```
 
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `provider` | 是 | Embedding 提供商（`jina` / `openai`） |
-| `apiKey` | 否 | API 密钥，省略时从环境变量读取（如 `JINA_API_KEY`、`OPENAI_API_KEY`） |
-| `model` | 否 | 模型名称，各 provider 有默认值 |
-| `baseUrl` | 否 | 自定义 API 端点 |
+原生函数通过 `@tool` 提供业务能力；可选 `output_schema` 接受 Pydantic 2 模型类或 JSON Schema 字典。
+MCP 连接时读取上游 `outputSchema` 或 AXI 元数据。字段文档仅用于搜索和查看，由注册方保证与输出一致，不参与返回校验或裁剪。
+接入步骤与完整配置见[README](../README.md)和[配置参考](configuration.md)。
 
-### axi describe
-
-查看单个工具的完整元数据，包括 input_schema。
+## 导出为 MCP
 
 ```bash
-axi describe jina-mcp-tools/jina_search
+# 四个元工具：search / grep / describe / run
+axi mcp
+
+# 平铺指定组；有输出定义时另提供 axi_describe
+axi mcp --server orders
+
+# 限定组但仍使用元工具
+axi mcp --server orders --meta
 ```
 
-**参数：**
+flat 模式按 tools/list 中的导出名调用。meta 模式搜索合并目录，整体最多 K 个工具；与 CLI 的两份目录拼接不同。
+传输选项见 `axi mcp --help`，内部职责见[架构](architecture.md)。
 
-| 参数 | 说明 |
-|------|------|
-| `tool_name` | 工具完整名称（位置参数），必填 |
+## Daemon 与排障
 
-**输出示例：**
-
-```json
-{"name":"jina_search","server":"jina-mcp-tools","description":"Search the web.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"count":{"type":"number","default":5}},"required":["query"]},"source":"mcp"}
-```
-
-### axi run
-
-执行工具。支持两种参数传递方式。
-
-**方式一：--key value 格式**
+需要访问 MCP 时自动启动 daemon，纯本地发现、查看和调用不经过它。
 
 ```bash
-axi run jina-mcp-tools/jina_search --query "hello" --count 3
-```
-
-值按目标工具 schema 决定是否 JSON 解析：字段声明为 `string` 时原样保留（`--title false` 是字符串 `"false"`，不会被转成布尔），其余字段尝试 JSON 解析（`--count 3`→数字、`--flag true`→布尔），解析失败落回字符串。
-
-**方式二：--json 格式**
-
-```bash
-axi run jina-mcp-tools/jina_search -j '{"query": "hello", "count": 3}'
-```
-
-适合参数结构复杂或需要传递嵌套对象的场景。
-
-**参数：**
-
-| 参数 | 缩写 | 说明 |
-|------|------|------|
-| `tool_name` | - | 工具完整名称（位置参数），必填 |
-| `--json` | `-j` | JSON 字符串格式的参数 |
-
-**输出格式（统一信封）：**
-
-```json
-{"status":"success","data":"..."}
-{"status":"error","error":"错误信息"}
-```
-
-### axi doctor
-
-自检当前环境：配置文件、daemon、MCP server 连接、embedding、native 工具来源。配置了 MCP server 时会拉起 daemon 验证连接。发现问题时以非零码退出，并在 `issues` 里给出可执行的下一步。
-
-```bash
+axi daemon start
+AXI_CONFIG=/absolute/path/to/axi.json axi daemon start
+axi daemon status
+axi daemon stop
 axi doctor
 ```
 
-**输出示例：**
-
-```json
-{"ok":true,"config":{"path":"~/.axi/axi.json","exists":true},"daemon":{"running":true,"pid":12345,"uptime_seconds":8},"native_tools":{"total":0,"servers":{},"from_config":[],"from_entry_points":[]},"mcp_servers":[{"server":"jina","status":"connected","tools":2}],"embedding":{"provider":null,"note":"BM25-only, no semantic search"},"issues":[]}
-```
-
-`native_tools.from_entry_points` 会列出所有通过 Python entry_points 自动注入的工具及其来源模块——任何已安装的包都可能注入工具，此项便于审计。
-
----
-
-## Daemon 模式
-
-MCP 工具通过后台 daemon 进程维持长连接。daemon 保持所有 MCP server 的连接常驻内存，CLI 命令通过 Unix socket 与 daemon 通信，避免每次命令都重新连接。
-
-这对需要保持状态的 MCP server（如 browser MCP，需要维持浏览器 session）至关重要。
-
-### 管理命令
-
-```bash
-# 启动 daemon（后台运行）
-axi daemon start
-
-# 指定配置文件
-axi daemon start --config /path/to/axi.json
-
-# 查看状态
-axi daemon status
-
-# 停止
-axi daemon stop
-```
-
-### 自动启动
-
-执行 `axi search`、`axi describe`、`axi run` 时，如果 daemon 未运行且存在 `axi.json`，axi 会自动启动 daemon。无需手动管理。
-
-### 工作原理
-
-```
-axi CLI ──(Unix socket ~/.axi/daemon.sock)──> axi daemon ──(stdio)──> MCP server A
-                                                          ──(stdio)──> MCP server B
-                                                          ──(stdio)──> MCP server C
-```
-
-- daemon 进程在后台常驻，PID 记录在 `~/.axi/daemon.pid`
-- CLI 通过 Unix domain socket 发送 JSON 请求，daemon 返回 JSON 响应
-- 原生 Python 工具不经过 daemon，直接在 CLI 进程内执行
-
----
-
-## 工具来源
-
-### MCP Server（通过 axi.json 配置）
-
-在项目根目录创建 `axi.json`，MCP server 配置放在 `mcpServers` 字段下：
-
-```json
-{
-    "mcpServers": {
-        "jina-mcp-tools": {
-            "command": "npx",
-            "args": ["jina-mcp-tools"],
-            "env": {
-                "JINA_API_KEY": "your-api-key"
-            }
-        },
-        "github": {
-            "command": "npx",
-            "args": ["@modelcontextprotocol/server-github"],
-            "env": {
-                "GITHUB_TOKEN": "your-token"
-            }
-        }
-    },
-    "nativeTools": [
-        {"module": "my_project.tools"},
-        {"module": "test/test_tool.py", "name": "test_tool"},
-        {"module": "my_project.analytics", "name": "analytics"}
-    ]
-}
-```
-
-**顶层字段：**
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `mcpServers` | 否 | MCP server 配置（对象） |
-| `nativeTools` | 否 | 原生工具配置列表（对象数组） |
-
-**mcpServers 内每个 server 的配置字段：**
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| key 名 | 是 | 作为工具命名空间（如 `jina-mcp-tools`） |
-| `command` | 与 `url` 二选一 | 启动 MCP server 的命令 |
-| `args` | 否 | 命令参数列表 |
-| `env` | 否 | 环境变量（stdio 型的凭据通道） |
-| `url` | 与 `command` 二选一 | HTTP streaming 地址 |
-| `headers` | 否 | 随每个请求附带的 header（HTTP 型的凭据通道） |
-
-配置完成后 axi 自动发现所有 MCP 工具，无需额外操作。工具名格式为 `server/tool_name`。
-
-### 原生 Python 工具（通过 @tool 装饰器）
-
-在 Python 模块中用 `@tool` 装饰器注册工具，然后在 `axi.json` 的 `nativeTools` 中声明模块路径。
-
-**nativeTools 配置字段：**
-
-| 字段 | 必填 | 说明 |
-|------|------|------|
-| `module` | 是 | 模块路径。支持文件路径（`.py` 后缀，如 `test/test_tool.py`）和 Python 模块路径（如 `my_project.tools`） |
-| `name` | 否 | 作为 server 名（命名空间）。省略时自动推导：文件路径取 stem（`test/test_tool.py` → `test_tool`），模块路径取最后一段（`my_project.tools` → `tools`） |
-
-配置示例：
-
-```json
-{
-    "nativeTools": [
-        {"module": "my_project.tools"},
-        {"module": "test/test_tool.py", "name": "test_tool"},
-        {"module": "my_project.analytics", "name": "analytics"}
-    ]
-}
-```
-
-- `{"module": "my_project.tools"}` — name 省略，自动推导为 `tools`，工具调用格式为 `tools/query_orders`
-- `{"module": "test/test_tool.py", "name": "test_tool"}` — 显式指定 name，工具调用格式为 `test_tool/some_tool`
-- `{"module": "my_project.analytics", "name": "analytics"}` — 显式指定 name，工具调用格式为 `analytics/some_tool`
-
-**工具定义示例：**
-
-```python
-from axi import tool
-
-@tool(name="query_orders", description="按区域查询订单")
-def query_orders(region: str, limit: int = 10) -> dict:
-    return {"orders": [...], "total": 42}
-```
-
-装饰器自动从函数签名提取参数 schema：
-
-- 类型映射：`str`→string, `int`→integer, `float`→number, `bool`→boolean, `list`→array, `dict`→object
-- 无默认值的参数标记为 required
-- 有默认值的参数记录 default
-
-可选提供 `output_example`，帮助 Agent 在 PTC 场景下理解返回格式：
-
-```python
-@tool(
-    name="query_orders",
-    description="按区域查询订单",
-    output_example={"orders": [{"id": 1, "region": "cn"}], "total": 1}
-)
-def query_orders(region: str, limit: int = 10) -> dict:
-    ...
-```
-
-注册后工具同时具备 CLI 调用和 PTC 调用能力。
-
----
-
-## PTC（Programmatic Tool Calling）
-
-PTC 允许 Agent 写一段 Python 代码批量调用工具，在本地做数据过滤和聚合，避免反复 LLM round-trip。
-
-```python
-from axi import tool
-
-# 获取工具的可调用对象
-search = tool("jina-mcp-tools/jina_search")
-reader = tool("jina-mcp-tools/jina_reader")
-
-# 搜索（返回值格式取决于 MCP server，先试调一次确认）
-results = search(query="python async", count=5)
-print(results)  # jina_search 返回纯文本，需要自行解析
-```
-
-`tool("name")` 返回一个普通 Python 函数：
-- 调用时传入关键字参数
-- 成功返回 `data` 字段的值（可能是字符串、dict 或其他类型，取决于工具实现）
-- 失败抛出 `RuntimeError`
-
-### PTC 与 output 格式
-
-- **原生工具**：如果提供了 `output_example`，可通过 `axi describe` 查看返回格式
-- **MCP 工具**：MCP 协议不含 output schema，建议先 `axi run` 一次查看真实返回结构，再编写批量处理代码
-
----
-
-## Agent 集成指南
-
-axi 的设计遵循**渐进式披露**原则，Agent 按需获取信息，避免上下文窗口爆炸。
-
-### 推荐工作流
-
-```
-1. axi search "<关键词>"         → 获取工具列表（轻量）
-2. axi describe <tool_name>      → 获取完整 schema（按需）
-3. axi run <tool_name> --params  → 执行
-```
-
-### Agent 使用示例
-
-**场景：Agent 需要搜索网页内容**
-
-```bash
-# Step 1: 发现可用工具
-$ axi search "web"
-[{"name":"jina-mcp-tools/jina_reader","description":"Read and extract content from web page.","source":"mcp"},{"name":"jina-mcp-tools/jina_search","description":"Search the web.","source":"mcp"}]
-
-# Step 2: 了解参数
-$ axi describe jina-mcp-tools/jina_search
-{"name":"jina_search","server":"jina-mcp-tools","description":"Search the web.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"count":{"type":"number","default":5}},"required":["query"]},"source":"mcp"}
-
-# Step 3: 执行
-$ axi run jina-mcp-tools/jina_search --query "python async tutorial" --count 3
-{"status":"success","data":"..."}
-```
-
-**场景：Agent 需要批量处理数据（PTC）**
-
-Agent 先探测返回格式，然后写脚本批量处理：
-
-```bash
-# 先试一次，看返回结构
-$ axi run jina-mcp-tools/jina_search --query "test" --count 1
-```
-
-根据返回结构编写 PTC 脚本：
-
-```python
-import re
-from axi import tool
-
-search = tool("jina-mcp-tools/jina_search")
-reader = tool("jina-mcp-tools/jina_reader")
-
-# 搜索（jina_search 返回纯文本，需解析 URL）
-results = search(query="python best practices", count=3)
-urls = re.findall(r'URL Source: (https?://\S+)', results)
-
-# 读取每个结果的完整内容
-for url in urls[:2]:
-    content = reader(url=url)
-    print(content[:500])
-    print("---")
-```
-
-### 输出约定
-
-- 所有命令输出统一为紧凑 JSON（单行），方便 Agent 解析
-- `axi run` 的返回统一为 `{"status":"success","data":...}` 或 `{"status":"error","error":"..."}` 信封格式
-- 非零退出码表示错误（如工具不存在）
+每份配置文件路径对应独立实例，运行文件位于 `~/.axi/daemons/<hash>.sock`、`.pid`、`.log`、`.lock`。
+daemon 默认空闲30分钟后退出，下次需要时自动启动；`stop` 等待目标完成清理后返回。
+
+- `status` 为 starting 时仍在连接上游，避免重复启动。
+- doctor 检查配置、工具来源、MCP 连接和 Embedding 配置；它可能启动 daemon，不逐个试调业务工具。
+- 远程发现失败时可能只返回本地结果，同时检查 stderr；daemon 中的检索降级原因查看对应日志。
+- 修改配置或升级后停止旧 daemon，并重启已有 MCP 导出进程。超时不表示上游操作未发生，不盲目重试有副作用的调用。
+- 超时、空闲退出及 Embedding 配置详见[配置参考](configuration.md)。

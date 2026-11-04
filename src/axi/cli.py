@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 from enum import Enum
+from typing import Any, Literal
 
 import typer
 from pydantic import BaseModel
@@ -16,16 +17,25 @@ from axi.daemon.client import (
     LOG_PATH,
     daemon_request,
     ensure_daemon,
+    fetch_description,
+    fetch_discovery,
+    fetch_tool_summaries,
     is_daemon_running,
     read_live_pid,
-    send_request,
     wait_for_exit,
+    send_request,
 )
 from axi.daemon.protocol import DaemonRequest
-from axi.models import RunResult, SearchResult, allowed_types
+from axi.models import (
+    RunResult,
+    ToolInfo,
+    allowed_types,
+)
+from axi.output.selection import DescribeSelection
 from axi.registry import (
     AmbiguousToolError,
     ToolNotFoundError,
+    ToolResolveError,
     split_names,
 )
 
@@ -152,69 +162,104 @@ def daemon_status() -> None:
 # ── 核心命令 ──────────────────────────────────────────────
 
 
-def _search_and_merge(
-    local_results: list[SearchResult],
-    daemon_method: str,
+def _discover(
+    method: Literal["search", "grep"],
     query: str,
     top_k: int,
-) -> None:
-    """执行 daemon 搜索，合并本地和远程结果后输出 JSON。"""
-    mcp_results: list[dict] = []
-    resp = daemon_request(DaemonRequest(method=daemon_method, query=query, top_k=top_k))
-    if resp.status == "success" and resp.data:
-        mcp_results = resp.data
-    elif resp.status == "error":
-        logger.warning("Daemon search failed: %s", resp.error)
-
-    # native（本地 registry）与 MCP（daemon）是两套独立索引，分数不可比，
-    # 无法跨源真正排序；各自已取回 top_k，直接并列拼接（本地在前）。
-    combined = [r.model_dump() for r in local_results] + mcp_results
-    typer.echo(json.dumps(combined, ensure_ascii=False))
+    *,
+    tool: str | None = None,
+) -> list[dict[str, Any]]:
+    """先检索 Native，再拼接 MCP 结果；远程失败时保留本地命中。"""
+    if tool is not None:
+        try:
+            meta = runtime.registry.resolve(tool)
+        except ToolNotFoundError:
+            if not app_config.mcp_servers:
+                raise
+        else:
+            return [
+                item.model_dump(exclude_none=True)
+                for item in runtime.registry.search(query, top_k, tool=meta.full_name)
+            ]
+        results = []
+    else:
+        retrieve = (
+            runtime.registry.search if method == "search" else runtime.registry.grep
+        )
+        results = [
+            item.model_dump(exclude_none=True) for item in retrieve(query, top_k=top_k)
+        ]
+    if top_k > 0 and app_config.mcp_servers:
+        try:
+            remote = fetch_discovery(
+                DaemonRequest(
+                    method=method,
+                    query=query,
+                    top_k=top_k,
+                    tool_name=tool,
+                )
+            )
+        except RuntimeError as exc:
+            if tool is not None:
+                raise
+            typer.echo(f"Daemon tool discovery failed: {exc}", err=True)
+        else:
+            results.extend(remote)
+    return results
 
 
 @app.command()
 def search(
     query: str = typer.Argument(help="搜索关键词"),
-    top_k: int = typer.Option(5, "--top-k", "-k", help="返回结果数量"),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="每种来源最多返回的工具数"),
+    tool: str | None = typer.Option(None, "--tool", help="限定工具，只搜索其输出字段"),
 ) -> None:
-    """混合搜索工具（BM25 + Embedding）。"""
-    local_results = runtime.registry.search(query, top_k=top_k)
-    _search_and_merge(local_results, "search", query, top_k)
+    """各来源内双路检索、交错去重，Native 在前、MCP 在后，最多各 K 个。"""
+    if top_k <= 0 or not query.strip():
+        _output_json([])
+        return
+    try:
+        results = _discover("search", query, top_k, tool=tool)
+    except (ToolResolveError, RuntimeError) as exc:
+        _output_json({"error": str(exc)})
+        raise typer.Exit(code=1)
+    _output_json(results)
 
 
 @app.command()
 def grep(
     pattern: str = typer.Argument(help="正则表达式"),
-    limit: int = typer.Option(10, "--limit", "-l", help="返回结果数量"),
+    limit: int = typer.Option(10, "--limit", "-l", help="每种来源最多返回的工具数"),
 ) -> None:
-    """正则表达式搜索工具。"""
+    """全文正则搜索工具名、描述及字段检索文本，忽略大小写。
+
+    字段与 search 共用“JSONPath: 类型；自身说明”；工具名、描述分别匹配，^ / $ 锚定各自完整文本。
+    工具内的命中字段按数据层级从浅到深稳定排序，再取 maxFields 条。
+    """
     try:
-        local_results = runtime.registry.grep(pattern, top_k=limit)
+        results = _discover("grep", pattern, limit)
     except ValueError as e:
         _output_json({"error": str(e)})
         raise typer.Exit(code=1)
-    _search_and_merge(local_results, "grep", pattern, limit)
+    _output_json(results)
 
 
 def _collect_tool_groups() -> dict[str | None, list[dict]]:
     """收集所有工具并按 server 分组。"""
     groups: dict[str | None, list[dict]] = {}
 
-    # 本地原生工具
-    for meta in runtime.registry.list_all():
+    # MCP 工具（通过 daemon）
+    mcp_tools: list[ToolInfo] = []
+    if app_config.mcp_servers:
+        try:
+            mcp_tools = fetch_tool_summaries()
+        except RuntimeError as exc:
+            typer.echo(f"Daemon tool listing failed: {exc}", err=True)
+
+    for meta in [*runtime.registry.list_all(), *mcp_tools]:
         groups.setdefault(meta.server, []).append(
             {"name": meta.name, "description": meta.description}
         )
-
-    # MCP 工具（通过 daemon）
-    mcp_tools: list[dict] = []
-    resp = daemon_request(DaemonRequest(method="list_tools"))
-    if resp.status == "success" and resp.data:
-        mcp_tools = resp.data
-        for t in mcp_tools:
-            groups.setdefault(t.get("server"), []).append(
-                {"name": t["name"], "description": t.get("description", "")}
-            )
 
     # daemon 未返回工具时，至少从配置列出 server
     if not mcp_tools:
@@ -273,37 +318,58 @@ def list_tools(
     typer.echo(json.dumps(result, ensure_ascii=False))
 
 
-def _resolve_tool(name: str) -> dict:
-    """解析单个工具，返回工具详情 dict 或 error dict。"""
-    try:
-        meta = runtime.registry.resolve(name)
-        return meta.model_dump(exclude_none=True)
-    except AmbiguousToolError as e:
-        return {"error": str(e)}
-    except ToolNotFoundError:
-        pass  # 本地未找到，继续尝试 daemon
-
-    resp = daemon_request(DaemonRequest(method="describe", tool_name=name))
-    if resp.status == "success":
-        return resp.data
-    return {"error": resp.error or f"Tool not found: {name}"}
+def _resolve_tools(
+    names: list[str],
+    selection: DescribeSelection,
+) -> list[dict[str, Any]]:
+    """按名称顺序解析工具，本地未找到时逐项请求远程说明。"""
+    describer = runtime.registry.prepare_describe(selection)
+    results: list[dict[str, Any]] = []
+    for name in names:
+        try:
+            description = describer.describe(runtime.registry.resolve(name))
+        except ToolNotFoundError as exc:
+            if app_config.mcp_servers:
+                result = fetch_description(name, selection)
+            else:
+                result = {"error": str(exc)}
+        except (AmbiguousToolError, ValueError) as exc:
+            result = {"error": str(exc)}
+        else:
+            result = description.model_dump(exclude_unset=True)
+        results.append(result)
+    return results
 
 
 @app.command()
 def describe(
     tool_name: str = typer.Argument(help="工具完整名称（逗号分隔多个）"),
+    fields: str | None = typer.Option(
+        None,
+        "--fields",
+        help='JSONPath 数组选择输出节点并展开一级，如 ["$.rows[*].id"]；省略/null=入参，["$"]=输出根，[]=空输出视图',
+    ),
+    schema: bool = typer.Option(
+        False,
+        "--schema",
+        help="读取已登记的完整输出 JSON Schema；不能与非 null 的 --fields 同用，不执行业务工具",
+    ),
 ) -> None:
-    """查看工具详情。"""
+    """默认查看入参；按需选择局部输出字段或完整输出 Schema。"""
+    try:
+        selection = DescribeSelection.prepare(
+            json.loads(fields) if fields is not None else None,
+            schema=schema,
+        )
+    except (ValueError, TypeError) as exc:
+        _output_json({"error": f"Invalid describe selection: {exc}"})
+        raise typer.Exit(code=1)
+
     names = split_names(tool_name)
-    if len(names) == 1:
-        result = _resolve_tool(names[0])
-        if "error" in result:
-            _output_json(result)
-            raise typer.Exit(code=1)
-        _output_json(result)
-        return
-    results = [_resolve_tool(n) for n in names]
-    typer.echo(json.dumps(results, ensure_ascii=False))
+    results = _resolve_tools(names, selection)
+    _output_json(results[0] if len(names) == 1 else results)
+    if len(names) == 1 and "error" in results[0]:
+        raise typer.Exit(code=1)
 
 
 @app.command(
@@ -341,11 +407,17 @@ def run(
         parsed = {}
     else:
         # 按目标 schema 解析 --key value（string 字段保留原文）；MCP schema 问 daemon
-        schema = (
-            meta.input_schema
-            if meta
-            else _resolve_tool(tool_name).get("input_schema", {})
-        )
+        if meta:
+            schema = meta.input_schema
+        else:
+            response = daemon_request(
+                DaemonRequest(method="describe", tool_name=tool_name)
+            )
+            schema = (
+                response.data.get("input_schema", {})
+                if response.status == "success"
+                else {}
+            )
         parsed = _parse_params(args, schema)
 
     _output_json(runtime.executor.run(tool_name, parsed))
@@ -406,7 +478,7 @@ def doctor() -> None:
         "from_entry_points": [{"name": ep.name, "value": ep.value} for ep in eps],
     }
 
-    # embedding
+    # Embedding 配置
     emb = app_config.search.embedding
     if emb.provider:
         embedding = {
