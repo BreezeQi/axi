@@ -6,8 +6,10 @@ import importlib.metadata
 import importlib.util
 import inspect
 import logging
+import sys
 import threading
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, create_model
@@ -19,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 # 函数和参数模型共享一个键，归入 server 时一起迁移。
 _native_tools: dict[str, tuple[Callable, type[BaseModel]]] = {}
+# 按声明模块的名称空间保留定义，归组前也不会丢失不同模块的同名工具。
+_tool_definitions: dict[
+    tuple[int, str], tuple[ToolMeta, Callable, type[BaseModel]]
+] = {}
 _modules_loaded = False
 _load_lock = threading.RLock()
 
@@ -88,6 +94,7 @@ def register_tool(
     )
 
     _native_tools[tool_name] = (func, model)
+    _tool_definitions[id(func.__globals__), tool_name] = (meta, func, model)
     return meta
 
 
@@ -111,7 +118,7 @@ def validate_native_params(name: str, params: dict[str, Any]) -> dict[str, Any]:
 NATIVE_TOOLS_ENTRY_POINT_GROUP = "axi.native_tools"
 
 
-def _import_from_file(file_path: str) -> None:
+def _import_from_file(file_path: str) -> ModuleType:
     """通过文件路径 import 模块，触发 @tool 注册。"""
     path = Path(file_path).expanduser()
     if not path.is_absolute():
@@ -125,6 +132,28 @@ def _import_from_file(file_path: str) -> None:
         raise ImportError(f"Cannot load module from: {file_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _module_tools(
+    module: ModuleType,
+) -> list[tuple[ToolMeta, Callable, type[BaseModel]]]:
+    """查找模块自身、已导入子模块及显式导出的工具，不依赖导入时机。"""
+    exports = list(vars(module).values())
+    namespaces = {
+        id(vars(value)) for value in [module, *exports] if isinstance(value, ModuleType)
+    }
+    namespaces.update(
+        id(vars(value))
+        for name, value in list(sys.modules.items())
+        if name.startswith(f"{module.__name__}.") and isinstance(value, ModuleType)
+    )
+    exported_ids = {id(value) for value in exports}
+    return [
+        definition
+        for (namespace, _), definition in _tool_definitions.items()
+        if namespace in namespaces or id(definition[1]) in exported_ids
+    ]
 
 
 def _resolve_server_name(entry: NativeToolEntry) -> str:
@@ -147,12 +176,11 @@ def _load_native_entry(
     if module in loaded:
         return
     try:
-        before = set(registry.list_names())
         if module.endswith(".py"):
-            _import_from_file(module)
+            imported = _import_from_file(module)
         else:
-            importlib.import_module(module)
-        new_names = [n for n in registry.list_names() if n not in before]
+            imported = importlib.import_module(module)
+        definitions = _module_tools(imported)
     except Exception:
         logger.exception(
             "Failed to load native tool module '%s' (from %s)", module, source
@@ -169,17 +197,22 @@ def _load_native_entry(
             source,
         )
     loaded[module] = server_name
-    for name in new_names:
-        registry.set_server(name, server_name)
-        _native_tools[f"{server_name}/{name}"] = _native_tools.pop(name)
+    for meta, func, model in definitions:
+        if registry.get(meta.full_name) is meta:
+            registry.set_server(meta.full_name, server_name)
+        else:
+            registry.register(meta.model_copy(update={"server": server_name}))
+        _native_tools[f"{server_name}/{meta.name}"] = (func, model)
+        if _native_tools.get(meta.full_name) == (func, model):
+            _native_tools.pop(meta.full_name)
     # 记录来源，便于审计：entry_points 自动发现意味着任何已安装的包都可能注入工具
     logger.info(
         "Loaded %d native tool(s) from '%s' (%s) under server '%s': %s",
-        len(new_names),
+        len(definitions),
         module,
         source,
         server_name,
-        ", ".join(new_names),
+        ", ".join(meta.name for meta, _, _ in definitions),
     )
 
 
