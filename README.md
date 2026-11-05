@@ -41,6 +41,16 @@ API / SDK / 函数 → @tool ┘                 └─ MCP：四个元工具 / 
 
 ## 安装
 
+### ServiceAgent 固定发行版
+
+本 fork 的 `service-agent-0.0.15.post1` 标签固定 ServiceAgent 已评测的 AXI 0.0.15 行为，发行包版本为 `0.0.15.post1`。通过 Git 标签或确定提交安装，不将其作为上游 PyPI 发行版；包名 `axi-cli`、命令 `axi` 和 Python 导入保持。
+
+```bash
+uv pip install "axi-cli @ git+https://github.com/BreezeQi/axi.git@service-agent-0.0.15.post1"
+```
+
+### 上游安装方式
+
 需要 Python 3.12+。当前 daemon 使用 Unix socket 和 `fcntl`，适用于 macOS / Linux；Windows 可在 WSL 中使用。
 
 ```bash

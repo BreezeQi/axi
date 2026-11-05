@@ -184,20 +184,19 @@ async def test_mcp_result_parsing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "structured,is_error,expected,render_calls",
+    "structured,is_error,expected",
     [
-        ({"answer": 7}, False, {"answer": 7}, 0),
-        ({}, False, {}, 0),
-        ({"answer": 7}, True, "Image content", 1),
-        (None, False, "Image content", 1),
+        ({"answer": 7}, False, {"answer": 7}),
+        ({}, False, {}),
+        ({"answer": 7}, True, "Image content"),
+        (None, False, "Image content"),
     ],
 )
-async def test_mcp_result_only_formats_display_content_when_needed(
+async def test_mcp_mixed_result_preserves_structured_data_and_error_priority(
     monkeypatch: pytest.MonkeyPatch,
     structured: dict[str, Any] | None,
     is_error: bool,
     expected: Any,
-    render_calls: int,
 ) -> None:
     render = Mock(return_value="Image content")
     monkeypatch.setattr(types.ImageContent, "__str__", render)
@@ -214,7 +213,6 @@ async def test_mcp_result_only_formats_display_content_when_needed(
     result = await provider.call_tool("test", "query", {})
     assert result.status == ("error" if is_error else "success")
     assert (result.error if is_error else result.data) == expected
-    assert render.call_count == render_calls
     conn.session.call_tool.assert_awaited_once_with("query", {})
 
 

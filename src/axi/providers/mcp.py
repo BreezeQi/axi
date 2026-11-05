@@ -154,10 +154,7 @@ class MCPConnection:
             raise RuntimeError("Not connected")
 
         result = await self.session.call_tool(tool_name, params)
-        if not result.is_error and result.structured_content is not None:
-            return result.structured_content
-
-        # 仅在报错或没有结构化结果时提取 content，避免复制未使用的图片等大块内容。
+        # 提取 content 中的文本
         contents = []
         for block in result.content:
             if hasattr(block, "text"):
@@ -167,6 +164,9 @@ class MCPConnection:
 
         if result.is_error:
             raise MCPToolError("\n".join(contents) or "Unknown tool error")
+
+        if result.structured_content is not None:
+            return result.structured_content
 
         if len(contents) == 1:
             # 尝试解析为 JSON
